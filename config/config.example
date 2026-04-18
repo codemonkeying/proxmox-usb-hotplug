@@ -1,9 +1,17 @@
 # /etc/usb-hotplug/config
 # Sourced by usb-mapping-daemon.sh at startup. Override the built-in defaults.
 
-# Proxmox resource mapping name for the GPU whose host VM receives shared-* USB devices.
-# Leave empty to disable shared-* routing (vm{ID}-* mappings still work).
-# Example: GPU_MAPPING="host1_rtx3090"
+# Anchor PCI resource mapping — shared-* USB devices follow the VM that
+# currently has this mapping attached. Typically a GPU but it's just a
+# string match, so any PCI mapping works.
+#
+# The value must match the *name* you gave the mapping in the Proxmox GUI
+# (Datacenter -> Resource Mappings -> PCI). The name is user-chosen, not
+# derived from hardware — anything goes as long as it matches exactly.
+#
+# Example:  GPU_MAPPING="host1_gpu"
+#
+# Leave empty to disable shared-* routing (vm{ID}-* still works).
 GPU_MAPPING=""
 
 # Poll interval in seconds for the main device-change loop

@@ -34,7 +34,19 @@ sudo ./install.sh
 
 The installer copies the two scripts to `/usr/local/bin/`, installs the systemd unit, creates `/etc/usb-hotplug/config`, and starts the service.
 
-If you use `shared-*` mappings, edit `/etc/usb-hotplug/config` and set `GPU_MAPPING` to the name of your GPU's resource mapping (the same string shown in **Datacenter → Resource Mappings → PCI**). Restart the service: `systemctl restart usb-hotplug.service`.
+If you want `shared-*` devices to follow a VM around, you need an **anchor PCI mapping**. This is nothing more than any existing Proxmox PCI resource mapping that you designate as the reference — the daemon will route `shared-*` USB devices to whichever running VM currently has that PCI mapping attached.
+
+It's typically a GPU (hence the variable name), but it's just a string match — a sound card, capture card, or any other PCI mapping works the same way.
+
+1. Create the mapping once in **Datacenter → Resource Mappings → PCI → Add**. Pick a name you'll remember — `host1_gpu`, `rtx4090`, `gpu1`, whatever. The name is *yours to choose*; it isn't derived from the hardware.
+2. Put that same string in `GPU_MAPPING` in `/etc/usb-hotplug/config`:
+
+   ```bash
+   GPU_MAPPING="host1_gpu"    # must match exactly what you named it in the GUI
+   ```
+3. Restart: `systemctl restart usb-hotplug.service`.
+
+Leave `GPU_MAPPING=""` (the default) if you don't need `shared-*` routing — `vm{ID}-*` mappings will still work.
 
 ## Usage
 
