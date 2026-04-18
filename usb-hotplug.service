@@ -1,0 +1,28 @@
+[Unit]
+Description=USB Hotplug Daemon for Proxmox VM Passthrough
+Documentation=man:qm(1)
+After=network.target pve-cluster.service pve-guests.service
+Wants=pve-cluster.service
+ConditionPathExists=/etc/pve/mapping/usb.cfg
+
+[Service]
+Type=simple
+ExecStartPre=/bin/rm -f /var/run/usb-hotplug-auto-vm.state
+ExecStart=/usr/local/bin/usb-mapping-daemon.sh
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=usb-hotplug
+
+PrivateNetwork=false
+PrivateDevices=false
+ProtectSystem=false
+ProtectHome=true
+NoNewPrivileges=false
+
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
