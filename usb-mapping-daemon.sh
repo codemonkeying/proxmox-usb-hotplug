@@ -110,6 +110,23 @@ remove_mapping_from_running_vm() {
     fi
 }
 
+cleanup_stale_shared_mappings() {
+    local current_gpu_vm="$1"
+
+    for vmid in $(qm list 2>/dev/null | awk 'NR>1 {print $1}'); do
+        [[ "$vmid" == "$current_gpu_vm" ]] && continue
+
+        qm config "$vmid" 2>/dev/null | grep -E "^usb[0-9]+:.*mapping=shared-" | while IFS= read -r line; do
+            local slot=$(echo "$line" | sed -n 's/^usb\([0-9]\+\):.*/\1/p')
+            local mapping=$(echo "$line" | sed -n 's/.*mapping=\(shared-[a-zA-Z0-9_-]*\).*/\1/p')
+            [[ -z "$slot" || -z "$mapping" ]] && continue
+            log "Cleanup: removing stale $mapping from VM $vmid (current GPU VM: ${current_gpu_vm:-none})"
+            with_lock qm set "$vmid" -delete "usb${slot}"
+            sed -i "/${mapping}:${vmid}/d" "$STATE_FILE"
+        done
+    done
+}
+
 monitor_usb_mappings() {
     log "USB Mapping Hotplug Daemon started (interval: ${INTERVAL}s)"
     log "Assignment rules:"
@@ -119,7 +136,7 @@ monitor_usb_mappings() {
 
     touch "$STATE_FILE"
 
-    local last_gpu_vm=""
+    local last_gpu_vm="<unset>"
     local last_running_vms=""
 
     while true; do
@@ -132,11 +149,14 @@ monitor_usb_mappings() {
         fi
 
         if [[ "$gpu_vm" != "$last_gpu_vm" ]]; then
-            if [[ -n "$gpu_vm" ]]; then
-                log "GPU VM detected: VM $gpu_vm (gets shared-* devices)"
-            else
-                log "No GPU VM detected"
+            if [[ "$last_gpu_vm" != "<unset>" ]]; then
+                if [[ -n "$gpu_vm" ]]; then
+                    log "GPU VM detected: VM $gpu_vm (gets shared-* devices)"
+                else
+                    log "No GPU VM detected"
+                fi
             fi
+            cleanup_stale_shared_mappings "$gpu_vm"
             last_gpu_vm="$gpu_vm"
         fi
 
