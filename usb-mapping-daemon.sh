@@ -4,6 +4,7 @@
 # Defaults — override in /etc/usb-hotplug/config
 INTERVAL=2
 GPU_MAPPING=""
+ENFORCE_PCI_EXCLUSIVITY=1
 LOG_FILE="/var/log/usb-hotplug.log"
 STATE_FILE="/var/run/usb-hotplug.state"
 AUTO_VM_FILE="/var/run/usb-hotplug-auto-vm.state"
@@ -22,9 +23,14 @@ log() {
 }
 
 with_lock() {
-    exec 200>"$LOCK_FILE"
-    flock -x 200
-    "$@"
+    # Subshell so fd 200 closes on return, releasing the flock. Without the
+    # subshell, fd 200 persists in the caller's shell and the lock is held
+    # forever — any later with_lock from a child subshell deadlocks.
+    (
+        exec 200>"$LOCK_FILE"
+        flock -x 200
+        "$@"
+    )
 }
 
 vm_running() {
@@ -110,6 +116,39 @@ remove_mapping_from_running_vm() {
     fi
 }
 
+cleanup_pci_passthrough_conflicts() {
+    [[ "${ENFORCE_PCI_EXCLUSIVITY}" != "1" ]] && return 0
+
+    declare -A owner=()
+    for vmid in $(get_running_vms); do
+        while IFS= read -r line; do
+            local mapping
+            mapping=$(echo "$line" | sed -n 's/^hostpci[0-9]\+: mapping=\([a-zA-Z0-9_-]*\).*/\1/p')
+            [[ -n "$mapping" ]] && owner["$mapping"]="$vmid"
+        done < <(qm config "$vmid" 2>/dev/null | grep -E "^hostpci[0-9]+: mapping=")
+    done
+
+    for mapping in "${!owner[@]}"; do
+        local owner_vmid="${owner[$mapping]}"
+        for other_conf in /etc/pve/qemu-server/*.conf; do
+            [[ -f "$other_conf" ]] || continue
+            local other_vmid
+            other_vmid=$(basename "$other_conf" .conf)
+            [[ "$other_vmid" == "$owner_vmid" ]] && continue
+
+            grep -qE "^hostpci[0-9]+: mapping=${mapping}($|[,[:space:]])" "$other_conf" || continue
+
+            local slot
+            slot=$(grep -E "^hostpci[0-9]+: mapping=${mapping}($|[,[:space:]])" "$other_conf" \
+                   | sed -n 's/^hostpci\([0-9]\+\):.*/\1/p' | head -1)
+            if [[ -n "$slot" ]]; then
+                log "PCI exclusivity: removing $mapping (hostpci${slot}) from VM $other_vmid (owned by running VM $owner_vmid)"
+                with_lock qm set "$other_vmid" -delete "hostpci${slot}" >/dev/null 2>&1
+            fi
+        done
+    done
+}
+
 cleanup_stale_shared_mappings() {
     local current_gpu_vm="$1"
 
@@ -133,6 +172,7 @@ monitor_usb_mappings() {
     log "  vm{ID}-*   devices -> VM {ID} when running"
     log "  shared-*   devices -> VM with GPU mapping (${GPU_MAPPING:-unset})"
     log "  disabled-* devices -> never auto-assigned"
+    log "PCI exclusivity: ${ENFORCE_PCI_EXCLUSIVITY:-1} (strip hostpci mappings from non-owner VMs)"
 
     touch "$STATE_FILE"
 
@@ -146,6 +186,7 @@ monitor_usb_mappings() {
         if [[ "$running_vms" != "$last_running_vms" ]]; then
             log "Running VMs: $running_vms"
             last_running_vms="$running_vms"
+            cleanup_pci_passthrough_conflicts
         fi
 
         if [[ "$gpu_vm" != "$last_gpu_vm" ]]; then

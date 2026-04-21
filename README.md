@@ -18,6 +18,19 @@ Proxmox can pass USB devices through to a VM, but you have to either bind the de
 
 An `flock`-guarded critical section prevents two simultaneous plug events from racing into the same `usbN` slot.
 
+## PCI passthrough exclusivity
+
+As of v0.2.0, the daemon also enforces exclusive ownership of **PCI resource mappings** (GPUs, NICs, capture cards — anything using `hostpci` passthrough). When a running VM has a `hostpci` mapping in its live config, the daemon strips that mapping from every *other* VM's live config so two VMs can never be simultaneously configured to claim the same device.
+
+Key properties:
+
+- Only touches live `/etc/pve/qemu-server/*.conf` files. **Profile configs are never modified**, so OS-specific `hostpci` flags (`x-vga`, `romfile`, `pcie`, `rombar`, etc.) declared in a Linux VM's profile and a Windows VM's profile remain intact — each VM reloads its own flavor when `start.sh` is next used.
+- Runs on daemon start and whenever the set of running VMs changes.
+- Doesn't try to hot-swap PCI passthrough between running VMs (not supported by qemu/vfio — hostpci is a boot-time binding).
+- If no VM is running with a given mapping, other VMs' configs are left alone — first VM to start next wins.
+
+Disable by setting `ENFORCE_PCI_EXCLUSIVITY=0` in `/etc/usb-hotplug/config`.
+
 ## Requirements
 
 - Proxmox VE 8.x or newer (uses the built-in `/etc/pve/mapping/usb.cfg` — introduced with resource mappings).

@@ -16,3 +16,11 @@ GPU_MAPPING=""
 
 # Poll interval in seconds for the main device-change loop
 INTERVAL=2
+
+# PCI passthrough exclusivity — when a running VM has a hostpci mapping in its
+# live config, strip that mapping from every other VM's live config so two VMs
+# can never be simultaneously configured to claim the same PCI device. The
+# daemon only touches live /etc/pve/qemu-server/*.conf files, never profile
+# configs, so OS-specific hostpci flags (x-vga, romfile, etc.) declared in
+# profile configs are preserved on next profile reload. Set to 0 to disable.
+ENFORCE_PCI_EXCLUSIVITY=1
