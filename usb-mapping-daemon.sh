@@ -151,15 +151,38 @@ cleanup_pci_passthrough_conflicts() {
 
 cleanup_stale_shared_mappings() {
     local current_gpu_vm="$1"
+    local hostname=$(hostname)
+
+    # Build a lookup of mapping name -> registered node from usb.cfg so we can
+    # identify shared-* entries on the GPU VM whose physical device lives on
+    # a different host. Process substitution keeps the array writes in this
+    # shell (a piped while loop runs in a subshell and can't mutate the array).
+    declare -A mapping_node
+    while IFS='|' read -r m _ _ n; do
+        mapping_node["$m"]="$n"
+    done < <(get_usb_mappings)
 
     for vmid in $(qm list 2>/dev/null | awk 'NR>1 {print $1}'); do
-        [[ "$vmid" == "$current_gpu_vm" ]] && continue
+        local is_gpu_vm=0
+        [[ "$vmid" == "$current_gpu_vm" ]] && is_gpu_vm=1
 
         qm config "$vmid" 2>/dev/null | grep -E "^usb[0-9]+:.*mapping=shared-" | while IFS= read -r line; do
             local slot=$(echo "$line" | sed -n 's/^usb\([0-9]\+\):.*/\1/p')
             local mapping=$(echo "$line" | sed -n 's/.*mapping=\(shared-[a-zA-Z0-9_-]*\).*/\1/p')
             [[ -z "$slot" || -z "$mapping" ]] && continue
-            log "Cleanup: removing stale $mapping from VM $vmid (current GPU VM: ${current_gpu_vm:-none})"
+
+            if [[ "$is_gpu_vm" -eq 1 ]]; then
+                # On the GPU VM, only scrub shared-* entries whose mapping
+                # belongs to a different node. Same-node shared-* are managed
+                # by the main loop's add/remove logic.
+                local mn="${mapping_node[$mapping]}"
+                if [[ -z "$mn" || "$mn" == "$hostname" ]]; then
+                    continue
+                fi
+                log "Cleanup: removing foreign-node $mapping (node=$mn) from GPU VM $vmid"
+            else
+                log "Cleanup: removing stale $mapping from VM $vmid (current GPU VM: ${current_gpu_vm:-none})"
+            fi
             with_lock qm set "$vmid" -delete "usb${slot}"
             sed -i "/${mapping}:${vmid}/d" "$STATE_FILE"
         done
@@ -202,9 +225,19 @@ monitor_usb_mappings() {
         fi
 
         local current_devices=$(lsusb | awk '{print $6}')
+        local hostname=$(hostname)
 
-        get_usb_mappings | while IFS='|' read -r mapping device_id description; do
+        get_usb_mappings | while IFS='|' read -r mapping device_id description node; do
             if [[ "$mapping" =~ ^disabled- ]]; then
+                continue
+            fi
+
+            # Skip mappings registered to a different node. Multiple mappings
+            # can share a vendor:product ID (Logitech 046d:c52b is reused
+            # across receivers / mice / keyboards), so the lsusb presence
+            # check below isn't sufficient to prove THIS mapping is local.
+            # The node= field in /etc/pve/mapping/usb.cfg is authoritative.
+            if [[ -n "$node" && "$node" != "$hostname" ]]; then
                 continue
             fi
 

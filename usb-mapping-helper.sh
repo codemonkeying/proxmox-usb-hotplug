@@ -4,30 +4,40 @@
 MAPPING_CONFIG="/etc/pve/mapping/usb.cfg"
 PROTECTED_VMS_CONFIG="/etc/usb-hotplug-protected-vms.conf"
 
-# Parse /etc/pve/mapping/usb.cfg into "mapping|device_id|description" lines.
+# Parse /etc/pve/mapping/usb.cfg into "mapping|device_id|description|node" lines.
 # Format in source file:
 #   mapping-name
 #       map id=vendor:product,node=nodename
+# The node field is emitted as the 4th pipe-delimited column. When a mapping
+# has multiple `map` lines on different nodes, only the last one parsed wins
+# (current installs use one node per mapping).
 get_usb_mappings() {
     [[ -f "$MAPPING_CONFIG" ]] || return 1
 
     local mapping=""
     local device=""
+    local node=""
 
     while IFS= read -r line; do
         if [[ "$line" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             if [[ -n "$mapping" && -n "$device" ]]; then
-                echo "${mapping}|${device}|${mapping}"
+                echo "${mapping}|${device}|${mapping}|${node}"
             fi
             mapping="$line"
             device=""
-        elif [[ "$line" =~ ^[[:space:]]+map[[:space:]]+id=([^,]+) ]]; then
-            device="${BASH_REMATCH[1]}"
+            node=""
+        elif [[ "$line" =~ ^[[:space:]]+map[[:space:]] ]]; then
+            if [[ "$line" =~ id=([^,[:space:]]+) ]]; then
+                device="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$line" =~ node=([^,[:space:]]+) ]]; then
+                node="${BASH_REMATCH[1]}"
+            fi
         fi
     done < "$MAPPING_CONFIG"
 
     if [[ -n "$mapping" && -n "$device" ]]; then
-        echo "${mapping}|${device}|${mapping}"
+        echo "${mapping}|${device}|${mapping}|${node}"
     fi
 }
 
@@ -43,8 +53,16 @@ is_vm_protected() {
 get_available_mappings_for_vm() {
     local vmid=$1
     local current_devices=$(lsusb | awk '{print $6}')
+    local hostname=$(hostname)
 
-    get_usb_mappings | while IFS='|' read -r mapping device_id description; do
+    get_usb_mappings | while IFS='|' read -r mapping device_id description node; do
+        # Skip mappings registered to a different node. Multiple distinct
+        # mappings can share a vendor:product (e.g. several Logitech receivers
+        # at 046d:c52b), so a local lsusb hit isn't enough to prove THIS
+        # mapping belongs here — the node= field is authoritative.
+        if [[ -n "$node" && "$node" != "$hostname" ]]; then
+            continue
+        fi
         if echo "$current_devices" | grep -q "^${device_id}$"; then
             if [[ "$mapping" =~ ^vm${vmid}- ]] || [[ "$mapping" =~ ^shared- ]]; then
                 echo "${mapping}|${device_id}|${description}"
@@ -173,8 +191,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-}" in
         "list-mappings")
             echo "Available USB device mappings:"
-            get_usb_mappings | while IFS='|' read -r mapping device_id description; do
-                echo "  $mapping: $device_id - $description"
+            get_usb_mappings | while IFS='|' read -r mapping device_id description node; do
+                echo "  $mapping: $device_id - $description (node=${node:-any})"
             done
             ;;
         "list-available")

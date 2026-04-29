@@ -18,6 +18,16 @@ Proxmox can pass USB devices through to a VM, but you have to either bind the de
 
 An `flock`-guarded critical section prevents two simultaneous plug events from racing into the same `usbN` slot.
 
+## Multi-node cluster behaviour
+
+In a Proxmox cluster, `/etc/pve/mapping/usb.cfg` is shared across every node and each mapping carries a `node=` field declaring which host the physical device is attached to. The daemon respects this:
+
+- A mapping with `node=otherhost` is **skipped** entirely on the local host — no add attempt, no log spam.
+- The lsusb presence check alone is not authoritative because multiple distinct mappings can share a vendor:product ID (e.g. several Logitech receivers / mice / keyboards all report `046d:c52b`). Without the node filter, a mapping pinned to a remote node would appear "satisfied locally" because some other Logitech device with the same VID:PID is plugged into this host.
+- On the GPU VM, `cleanup_stale_shared_mappings` also strips foreign-node `shared-*` entries that may have been left in the live config from a previous session — so when a remote host hosting a shared device goes offline, its `shared-*` mappings stop polluting the GPU VM's `usbN:` slots.
+
+A mapping with no `node=` field at all is treated as "any host" (unusual, but safe).
+
 ## PCI passthrough exclusivity
 
 As of v0.2.0, the daemon also enforces exclusive ownership of **PCI resource mappings** (GPUs, NICs, capture cards — anything using `hostpci` passthrough). When a running VM has a `hostpci` mapping in its live config, the daemon strips that mapping from every *other* VM's live config so two VMs can never be simultaneously configured to claim the same device.
