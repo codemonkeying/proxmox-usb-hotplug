@@ -91,7 +91,24 @@ add_mapping_to_running_vm() {
 
     if with_lock qm set "$vmid" -usb${slot} "mapping=${mapping},usb3=1"; then
         if qm config "$vmid" 2>/dev/null | grep -q "mapping=${mapping}"; then
-            log "Successfully added mapping $mapping to VM $vmid"
+            # qm set writes the runtime config but does NOT actually attach the
+            # device at the QEMU level — that only happens at the VM's next
+            # stop+start cycle. To get an immediate live attach (so the guest
+            # sees the device within ~1 daemon cycle of plug-in instead of
+            # "after next reboot"), issue a QMP device_add directly. The
+            # config line above already carries the mapping so PVE will
+            # re-attach the same device on future starts; this is just for
+            # the right-now attach.
+            local vid="${device_id%%:*}"
+            local pid="${device_id##*:}"
+            local qmp_out
+            qmp_out=$(echo "device_add usb-host,bus=xhci.0,vendorid=0x${vid},productid=0x${pid},id=usb${slot}" \
+                | timeout 5 qm monitor "$vmid" 2>&1)
+            if echo "$qmp_out" | grep -qiE '(^|[^a-z])error|failed'; then
+                log "WARN: qm set succeeded but QMP device_add failed for usb${slot} (${vid}:${pid}). Device will attach on next VM stop+start. QMP said: $(echo "$qmp_out" | tr '\n' ' ' | head -c 200)"
+            else
+                log "Successfully added mapping $mapping to VM $vmid (config + live device_add usb${slot})"
+            fi
             echo "${mapping}:${vmid}" >> "$STATE_FILE"
             return 0
         fi
