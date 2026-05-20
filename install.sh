@@ -32,32 +32,6 @@ echo "Installing systemd service..."
 install -m 0644 usb-hotplug.service /etc/systemd/system/usb-hotplug.service
 systemctl daemon-reload
 
-echo "Installing pre-start hookscript to /var/lib/vz/snippets/..."
-mkdir -p /var/lib/vz/snippets
-install -m 0755 hooks/usb-prestart-clean.sh /var/lib/vz/snippets/usb-prestart-clean.sh
-
-if pvesm status -storage local &>/dev/null; then
-    local_content=$(pvesm status -storage local -- 2>/dev/null | awk 'NR==2{print $2}')
-    if ! grep -qE '(^|[[:space:]])snippets([[:space:]]|$)' <<<"${local_content//,/ }"; then
-        current=$(awk '/^dir: local$/{f=1;next} f && /^[[:space:]]+content[[:space:]]/{sub(/.*content[[:space:]]+/,"");print;exit} f && /^[a-z]+:/{exit}' /etc/pve/storage.cfg)
-        if [[ -n "$current" && "$current" != *snippets* ]]; then
-            new="${current},snippets"
-            echo "  Adding 'snippets' to local storage content (was: $current)"
-            pvesm set local --content "$new" || echo "  WARN: could not update local storage content automatically; add 'snippets' to its content list manually"
-        fi
-    fi
-fi
-
-cat <<'HOOKINFO'
-
-Hookscript installed. To enable per-VM pre-start cleanup of missing USB devices:
-
-  qm set <VMID> --hookscript local:snippets/usb-prestart-clean.sh
-
-Apply to any VM that has `usbN: mapping=...` lines and where you'd rather the VM
-boot without that USB attached than fail to start when the device is unplugged.
-HOOKINFO
-
 echo "Setting up config directory..."
 mkdir -p /etc/usb-hotplug
 if [[ ! -f /etc/usb-hotplug/config ]]; then
