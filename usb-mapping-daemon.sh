@@ -104,16 +104,28 @@ add_mapping_to_running_vm() {
 remove_mapping_from_running_vm() {
     local vmid=$1
     local mapping=$2
+    local config="/etc/pve/qemu-server/${vmid}.conf"
+
+    local slot=$(qm config "$vmid" --current 1 2>/dev/null | grep "mapping=${mapping}" | sed -n 's/^usb\([0-9]\+\):.*/\1/p')
+
+    [[ -z "$slot" ]] && return 0
 
     log "Removing USB mapping $mapping from VM $vmid"
+    qm set "$vmid" -delete usb${slot} 2>/dev/null
 
-    local slot=$(qm config "$vmid" | grep "mapping=${mapping}" | sed -n 's/^usb\([0-9]\+\):.*/\1/p')
-
-    if [[ -n "$slot" ]]; then
-        qm set "$vmid" -delete usb${slot}
-        sed -i "/${mapping}:${vmid}/d" "$STATE_FILE"
-        log "Removed mapping $mapping from VM $vmid (was usb${slot})"
+    # Did the line actually leave current config? When QEMU has no live
+    # device for usb${slot} (phantom entry from a prior unplug), PVE moves
+    # the delete to [PENDING] instead of applying it — which would loop
+    # forever next iteration. Detect that and clean up directly so the
+    # config matches reality and the next iteration is a no-op.
+    if grep -qE "^usb${slot}:.*mapping=${mapping}" "$config"; then
+        log "Hot-unplug deferred (no live device for usb${slot}); reverting pending and clearing line directly"
+        qm set "$vmid" --revert usb${slot} 2>/dev/null
+        sed -i "/^usb${slot}:.*mapping=${mapping}/d" "$config"
     fi
+
+    sed -i "/${mapping}:${vmid}/d" "$STATE_FILE"
+    log "Removed mapping $mapping from VM $vmid (was usb${slot})"
 }
 
 cleanup_pci_passthrough_conflicts() {
