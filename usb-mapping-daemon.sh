@@ -128,6 +128,76 @@ remove_mapping_from_running_vm() {
     log "Removed mapping $mapping from VM $vmid (was usb${slot})"
 }
 
+remove_mapping_from_stopped_vm() {
+    # Strip a ghost usbN: mapping=NAME line directly from a stopped VM's conf.
+    # Needed because remove_mapping_from_running_vm uses `qm set` which only
+    # works on a running VM — a stopped VM with a ghost mapping would never
+    # get cleaned, blocking the next start with "USB device mapping not found".
+    local vmid=$1
+    local mapping=$2
+    local config="/etc/pve/qemu-server/${vmid}.conf"
+
+    [[ -f "$config" ]] || return 0
+
+    local slot
+    slot=$(grep -E "^usb[0-9]+:[[:space:]]*mapping=${mapping}($|[,[:space:]])" "$config" \
+           | sed -n 's/^usb\([0-9]\+\):.*/\1/p' | head -1)
+    [[ -z "$slot" ]] && return 0
+
+    log "Stripping ghost mapping $mapping (usb${slot}) from stopped VM $vmid"
+    sed -i "/^usb${slot}:[[:space:]]*mapping=${mapping}/d" "$config"
+    sed -i "/${mapping}:${vmid}/d" "$STATE_FILE" 2>/dev/null
+}
+
+prestrip_all_vms() {
+    # One-shot strip pass: for every VM config, remove any usbN: mapping=NAME
+    # line whose underlying USB device is not currently present on this host.
+    # Designed to run as ExecStartPre, before pve-guests starts VMs at boot,
+    # so VM 100 (router) and any other vm{ID}-* VM can boot even if some
+    # passthrough devices are unplugged. Idempotent.
+    log "Prestrip: scanning VM configs for ghost USB mappings"
+    local hostname=$(hostname)
+    local current_devices=$(lsusb | awk '{print $6}')
+
+    declare -A mapping_device
+    declare -A mapping_node
+    while IFS='|' read -r m id _ n; do
+        mapping_device["$m"]="$id"
+        mapping_node["$m"]="$n"
+    done < <(get_usb_mappings)
+
+    local stripped=0
+    for config in /etc/pve/qemu-server/*.conf; do
+        [[ -f "$config" ]] || continue
+        local vmid
+        vmid=$(basename "$config" .conf)
+
+        while IFS= read -r line; do
+            local slot mapping
+            slot=$(echo "$line" | sed -n 's/^usb\([0-9]\+\):.*/\1/p')
+            mapping=$(echo "$line" | sed -n 's/.*mapping=\([a-zA-Z0-9_-]*\).*/\1/p')
+            [[ -z "$slot" || -z "$mapping" ]] && continue
+
+            local mn="${mapping_node[$mapping]}"
+            if [[ -n "$mn" && "$mn" != "$hostname" ]]; then
+                continue
+            fi
+
+            local device_id="${mapping_device[$mapping]}"
+            [[ -z "$device_id" ]] && continue
+
+            if echo "$current_devices" | grep -q "^${device_id}$"; then
+                continue
+            fi
+
+            log "Prestrip: removing ghost usb${slot} (mapping=$mapping, id=$device_id) from VM $vmid"
+            sed -i "/^usb${slot}:[[:space:]]*mapping=${mapping}/d" "$config"
+            stripped=$((stripped + 1))
+        done < <(grep -E "^usb[0-9]+:[[:space:]]*mapping=" "$config")
+    done
+    log "Prestrip: complete ($stripped line(s) removed)"
+}
+
 cleanup_pci_passthrough_conflicts() {
     [[ "${ENFORCE_PCI_EXCLUSIVITY}" != "1" ]] && return 0
 
@@ -257,7 +327,9 @@ monitor_usb_mappings() {
 
             if [[ "$mapping" =~ ^vm([0-9]+)- ]]; then
                 target_vm="${BASH_REMATCH[1]}"
-                vm_running "$target_vm" || continue
+                # Don't gate on vm_running. Ghost usbN lines on a STOPPED VM
+                # block its next boot — daemon needs to strip them whether the
+                # VM is running or not. Add-path still requires running (below).
             elif [[ "$mapping" =~ ^shared- ]]; then
                 target_vm="$gpu_vm"
                 [[ -z "$target_vm" ]] && continue
@@ -266,12 +338,18 @@ monitor_usb_mappings() {
             fi
 
             if echo "$current_devices" | grep -q "^${device_id}$"; then
-                if ! mapping_already_assigned "$target_vm" "$mapping"; then
+                # Device present — can only attach to a running VM.
+                if vm_running "$target_vm" && ! mapping_already_assigned "$target_vm" "$mapping"; then
                     add_mapping_to_running_vm "$target_vm" "$mapping" "$device_id" "$description"
                 fi
             else
+                # Device absent — strip ghost mapping regardless of VM state.
                 if mapping_already_assigned "$target_vm" "$mapping"; then
-                    remove_mapping_from_running_vm "$target_vm" "$mapping"
+                    if vm_running "$target_vm"; then
+                        remove_mapping_from_running_vm "$target_vm" "$mapping"
+                    else
+                        remove_mapping_from_stopped_vm "$target_vm" "$mapping"
+                    fi
                 fi
             fi
         done
@@ -281,6 +359,10 @@ monitor_usb_mappings() {
 }
 
 case "${1:-}" in
+    "--prestrip")
+        prestrip_all_vms
+        exit 0
+        ;;
     "--help"|"-h")
         echo "Usage: $0 [options]"
         echo ""
