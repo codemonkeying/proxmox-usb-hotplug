@@ -8,7 +8,9 @@ ENFORCE_PCI_EXCLUSIVITY=1
 LOG_FILE="/var/log/usb-hotplug.log"
 STATE_FILE="/var/run/usb-hotplug.state"
 AUTO_VM_FILE="/var/run/usb-hotplug-auto-vm.state"
-LOCK_FILE="/var/run/usb-hotplug.lock"
+LOCK_FILE="/var/run/proxmox-vm-conf.lock"
+GPU_MISS_THRESHOLD=2  # require N consecutive empty GPU-VM polls before treating as a real transition (debounces mid-run qm-start/stop transients)
+BOOT_GRACE_SECONDS=180  # at daemon start, suppress cleanup_stale_shared_mappings for this long so pve-guests has time to start VM 110 before we strip its conf (2026-06-04 reboot incident)
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/usb-mapping-helper.sh" 2>/dev/null || source "/usr/local/bin/usb-mapping-helper.sh"
@@ -283,6 +285,9 @@ monitor_usb_mappings() {
 
     local last_gpu_vm="<unset>"
     local last_running_vms=""
+    local gpu_miss_count=0
+    local daemon_start_ts=$(date +%s)
+    log "Boot grace: ${BOOT_GRACE_SECONDS}s suppressing cleanup until GPU VM appears (avoids stripping shared-* before pve-guests starts VM 110)"
 
     while true; do
         local running_vms=$(get_running_vms | tr '\n' ' ')
@@ -292,6 +297,50 @@ monitor_usb_mappings() {
             log "Running VMs: $running_vms"
             last_running_vms="$running_vms"
             cleanup_pci_passthrough_conflicts
+        fi
+
+        # Debounce GPU VM disappearance — two cases:
+        # (A) Mid-run transient: was present, gpu_vm momentarily empty during
+        #     qm start/stop. GPU_MISS_THRESHOLD consecutive empty polls = ~4s
+        #     defer.
+        # (B) Boot-time: daemon up before pve-guests finished. last_gpu_vm is
+        #     "<unset>", gpu_vm empty. Without defer, cleanup_stale* runs on
+        #     the not-yet-started VM's conf and STRIPS all shared-* entries
+        #     (caused 2026-06-04 reboot incident). Use BOOT_GRACE_SECONDS
+        #     elapsed since daemon-start so pve-guests has time (~3 min)
+        #     to bring VM 110 up.
+        local now=$(date +%s)
+        local uptime=$((now - daemon_start_ts))
+        local in_boot_grace=0
+        [[ "$last_gpu_vm" == "<unset>" && $uptime -lt $BOOT_GRACE_SECONDS ]] && in_boot_grace=1
+
+        local skip_cleanup=0
+        if [[ -z "$gpu_vm" && -n "$last_gpu_vm" ]]; then
+            if [[ $in_boot_grace -eq 1 ]]; then
+                # Boot grace: suppress cleanup silently (don't spam the log every 2s).
+                # Periodic heartbeat every 30s so operator knows we're alive.
+                if [[ $((uptime % 30)) -lt $INTERVAL ]]; then
+                    log "Boot grace: GPU VM not yet detected (${uptime}s/${BOOT_GRACE_SECONDS}s) — deferring cleanup"
+                fi
+                skip_cleanup=1
+            else
+                gpu_miss_count=$((gpu_miss_count + 1))
+                if [[ $gpu_miss_count -lt $GPU_MISS_THRESHOLD ]]; then
+                    if [[ "$last_gpu_vm" == "<unset>" ]]; then
+                        log "GPU VM not detected after boot grace (miss $gpu_miss_count/$GPU_MISS_THRESHOLD) — deferring cleanup"
+                    else
+                        log "GPU VM ($last_gpu_vm) transiently missing (miss $gpu_miss_count/$GPU_MISS_THRESHOLD) — deferring cleanup"
+                    fi
+                    skip_cleanup=1
+                fi
+            fi
+        else
+            gpu_miss_count=0
+        fi
+
+        if [[ $skip_cleanup -eq 1 ]]; then
+            sleep $INTERVAL
+            continue
         fi
 
         if [[ "$gpu_vm" != "$last_gpu_vm" ]]; then
