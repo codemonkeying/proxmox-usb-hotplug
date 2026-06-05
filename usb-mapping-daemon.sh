@@ -18,6 +18,11 @@ source "${SCRIPT_DIR}/usb-mapping-helper.sh" 2>/dev/null || source "/usr/local/b
 CONFIG_FILE="${USB_HOTPLUG_CONFIG:-/etc/usb-hotplug/config}"
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
+# Pool config — plug-anywhere auto-slot-assignment for multiple identical USB
+# devices (same VID:PID, no unique iSerial). See pools.conf.example in the repo
+# and the "USB pools" section in README.md.
+POOLS_CONF="${POOLS_CONF:-/etc/usb-hotplug/pools.conf}"
+
 log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "$msg"
@@ -273,6 +278,140 @@ cleanup_stale_shared_mappings() {
     done
 }
 
+# ============================================================
+# USB POOLS — plug-anywhere multi-device auto-assignment
+# ============================================================
+#
+# Pools solve the "two identical USB devices, no unique serial" problem that
+# standard PVE mappings can't: when you have N copies of the same VID:PID
+# (game controllers, WiFi adapters, DACs, etc.), the only way to disambiguate
+# them is by physical USB path — but pinning a path makes the device port-
+# specific. A pool dynamically assigns whichever devices are present to a
+# fixed range of consecutive usbN slots on a target VM, sorted by USB path
+# (lowest path = first slot).
+#
+# Config file format — /etc/usb-hotplug/pools.conf
+#   <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_slots>  [usb3]
+# One pool per non-comment line. Whitespace-separated. Pool name is free-form
+# (used in logs only). max_slots is the upper bound on how many devices to
+# attach simultaneously; extras are ignored. first_slot is the lowest usbN
+# index the pool owns; the pool occupies [first_slot, first_slot+max_slots-1].
+# Append "usb3" (or "1") as the optional 6th field to force usb3=1 on attach.
+#
+# Pool-owned slots are recognised by the daemon by their `host=<bus-port>`
+# value (the format the pool itself writes). Slots in the pool range with a
+# different format (mapping=..., host=<vid:pid>, etc.) are LEFT ALONE — the
+# pool never clobbers a manually-configured slot.
+#
+# Pools fire on every poll alongside the mapping logic. Pool entries pointing
+# at VMs not running on this host are silently skipped (qm status returns
+# non-running for cross-node VMs), so the same pools.conf can be deployed
+# fleet-wide if desired.
+
+find_pool_paths() {
+    # Print USB bus-port paths of devices matching VID:PID, lexicographically
+    # sorted. Reads directly from /sys to avoid lsusb overhead and to get the
+    # canonical bus-port format that qm host=... expects.
+    local target="$1"
+    local target_vid="${target%%:*}"
+    local target_pid="${target##*:}"
+    [[ -z "$target_vid" || -z "$target_pid" ]] && return 0
+    target_vid="${target_vid,,}"
+    target_pid="${target_pid,,}"
+
+    local d v p
+    for d in /sys/bus/usb/devices/*; do
+        # Skip endpoint dirs (have ":") and root hubs (no idVendor file).
+        [[ "$(basename "$d")" =~ : ]] && continue
+        [[ -f "$d/idVendor" && -f "$d/idProduct" ]] || continue
+        v=$(cat "$d/idVendor" 2>/dev/null)
+        p=$(cat "$d/idProduct" 2>/dev/null)
+        if [[ "${v,,}" == "$target_vid" && "${p,,}" == "$target_pid" ]]; then
+            basename "$d"
+        fi
+    done | sort
+}
+
+process_pools() {
+    [[ ! -f "$POOLS_CONF" ]] && return 0
+
+    local pool_name vidpid vmid first_slot max_slots usb3_flag
+    while read -r pool_name vidpid vmid first_slot max_slots usb3_flag _rest; do
+        # Strip whole-line comments / blank lines (read loses the # split,
+        # so check the first field).
+        [[ -z "$pool_name" || "$pool_name" =~ ^# ]] && continue
+
+        # Validate required fields.
+        if [[ -z "$vidpid" || -z "$vmid" || -z "$first_slot" || -z "$max_slots" ]]; then
+            log "pool: skipping incomplete entry: $pool_name"
+            continue
+        fi
+        if ! [[ "$vidpid" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+            log "pool $pool_name: invalid vid:pid '$vidpid'"
+            continue
+        fi
+        if ! [[ "$vmid" =~ ^[0-9]+$ && "$first_slot" =~ ^[0-9]+$ && "$max_slots" =~ ^[0-9]+$ ]]; then
+            log "pool $pool_name: non-numeric vmid/first_slot/max_slots"
+            continue
+        fi
+        [[ "$max_slots" -lt 1 ]] && continue
+
+        # Cross-node VMs are silently skipped — qm status returns non-running
+        # for VMs not on this node.
+        vm_running "$vmid" || continue
+
+        local usb3_arg=""
+        if [[ "$usb3_flag" == "usb3" || "$usb3_flag" == "1" ]]; then
+            usb3_arg=",usb3=1"
+        fi
+
+        # Discover currently-present devices and assign by sort order.
+        local -a paths=()
+        local p
+        while IFS= read -r p; do
+            paths+=("$p")
+        done < <(find_pool_paths "$vidpid")
+
+        local conf_snapshot
+        conf_snapshot=$(qm config "$vmid" 2>/dev/null) || continue
+
+        local i slot current_path current_conf desired
+        for ((i=0; i<max_slots; i++)); do
+            slot=$((first_slot + i))
+            current_path="${paths[i]:-}"
+            current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
+
+            if [[ -n "$current_path" ]]; then
+                desired="host=${current_path}${usb3_arg}"
+                if [[ "$current_conf" == "$desired" ]]; then
+                    continue  # already correct
+                fi
+
+                if [[ -n "$current_conf" ]]; then
+                    # Existing slot occupied — only overwrite if it's a pool-
+                    # managed value (host=<bus-port>). Leave mappings + host=<vid:pid>
+                    # entries alone.
+                    if [[ "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
+                        log "pool $pool_name: VM $vmid usb${slot} path drift -> $current_path"
+                        with_lock qm set "$vmid" "--usb${slot}" "$desired" 2>&1 | logger -t usb-hotplug-pool
+                    else
+                        log "pool $pool_name: VM $vmid usb${slot} occupied by non-pool entry (${current_conf}); skipping"
+                    fi
+                else
+                    log "pool $pool_name: attach VM $vmid usb${slot} -> $current_path"
+                    with_lock qm set "$vmid" "--usb${slot}" "$desired" 2>&1 | logger -t usb-hotplug-pool
+                fi
+            else
+                # No device for this slot index — strip pool-owned ghosts only.
+                if [[ -n "$current_conf" && "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
+                    log "pool $pool_name: detach VM $vmid usb${slot} (device gone)"
+                    with_lock qm set "$vmid" "--delete" "usb${slot}" 2>&1 | logger -t usb-hotplug-pool
+                fi
+            fi
+        done
+    done < "$POOLS_CONF"
+}
+
 monitor_usb_mappings() {
     log "USB Mapping Hotplug Daemon started (interval: ${INTERVAL}s)"
     log "Assignment rules:"
@@ -402,6 +541,11 @@ monitor_usb_mappings() {
                 fi
             fi
         done
+
+        # Pools (multi-device plug-anywhere) — runs after mapping logic so a
+        # pool can't fight with a mapping that already grabbed the device on
+        # this poll. Pools targeting cross-node VMs are silently skipped.
+        process_pools
 
         sleep "$INTERVAL"
     done

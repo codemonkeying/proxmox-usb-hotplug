@@ -98,6 +98,33 @@ Example naming scheme for a two-VM home lab where VM 110 is a Linux desktop with
 | `shared-mouse` | same |
 | `disabled-usb-drive` | never attached (opt-in later by renaming) |
 
+## USB pools (multiple identical devices)
+
+Standard mappings break down when you have **two or more physically identical** USB devices — same VID:PID, no unique iSerial. The classic example is a pair of identical game-controller wireless dongles (SteelSeries Stratus Duo, Xbox 360 wireless, etc.), but the same problem applies to multiple identical USB WiFi adapters, audio interfaces, security keys, or webcams. PVE's USB passthrough only distinguishes such devices by physical USB path — but pinning a `path=` in the mapping locks you to one specific port on one specific dock, which defeats the point of plug-anywhere.
+
+**A pool** fixes this by dynamically assigning whichever matching devices are currently plugged in to a fixed range of consecutive `usbN:` slots on a target VM, sorted by USB path (lowest path → first slot). Plug into any port on any dock — the pool picks it up.
+
+Define pools in `/etc/usb-hotplug/pools.conf` (one per non-comment line, whitespace-separated):
+
+```
+# <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_slots>  [usb3]
+steelseries  1038:1430  110  4  2  usb3
+alfa-router  148f:3070  200  6  1
+```
+
+- `pool_name` — free-form, logs only
+- `vid:pid` — the USB VID:PID of the device class
+- `target_vmid` — the VM the devices should attach to (must be on this node; cross-node entries are silently skipped)
+- `first_slot` — lowest `usbN` index the pool owns (e.g. `4` → starts at `usb4`)
+- `max_slots` — maximum number of devices to attach concurrently; extras beyond this are ignored
+- `usb3` — optional 6th field; pass `usb3` or `1` to force `usb3=1` on attach
+
+A copy of the example file ships as `pools.conf.example` — copy it to `/etc/usb-hotplug/pools.conf` and edit. Pools fire every poll alongside the standard mapping logic.
+
+**Safety**: pool-owned slots are recognised by their `host=<bus-port>` value (the format the pool itself writes). Slots in the pool range that contain a different format (`mapping=...`, `host=<vid:pid>`, etc.) are **left alone** — the pool never clobbers manually-configured slots. Pick a `first_slot` that doesn't overlap with any of your `vmN-` / `shared-` mappings to avoid contention.
+
+**Slot identity caveat**: pool members are interchangeable to PVE. Slot `first_slot` always holds whichever pool device has the lowest current USB path. If you unplug one device and plug it into a different port, the pool may re-assign slots on the next poll. For most use cases (controllers, wifi adapters) this is fine; for cases where the OS inside the VM needs a stable per-device identity (e.g. a USB audio device with persistent ALSA bindings), use traditional `path=`-locked mappings instead.
+
 ## Protected VMs
 
 Some VMs should never be touched by this daemon — a router VM that hard-binds a specific NIC, for example. Add its ID to `/etc/usb-hotplug-protected-vms.conf` (one VMID per line) or use `usb-mapping-helper.sh protect VMID`.
@@ -110,6 +137,7 @@ Some VMs should never be touched by this daemon — a router VM that hard-binds 
 | `/usr/local/bin/usb-mapping-helper.sh` | mapping lib + CLI (`list-mappings`, `protect`, etc.) |
 | `/etc/systemd/system/usb-hotplug.service` | systemd unit |
 | `/etc/usb-hotplug/config` | daemon config (GPU_MAPPING, INTERVAL) |
+| `/etc/usb-hotplug/pools.conf` | optional USB pool definitions (see "USB pools") |
 | `/etc/usb-hotplug-protected-vms.conf` | one VMID per line; excluded from management |
 | `/var/log/usb-hotplug.log` | daemon log (also goes to journald) |
 | `/var/run/usb-hotplug.state` | currently-assigned mappings |

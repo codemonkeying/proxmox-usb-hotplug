@@ -1,0 +1,42 @@
+# /etc/usb-hotplug/pools.conf — USB pool mappings
+#
+# Pools solve the "two identical USB devices" problem that standard PVE
+# mappings can't: when you have N copies of the same VID:PID with no unique
+# iSerial (game controllers, WiFi adapters, DACs, etc.), there's no way to
+# tell them apart. A pool dynamically assigns whichever devices are present
+# to a fixed range of consecutive usbN slots on a target VM, sorted by USB
+# path (lowest path = first slot).
+#
+# Format — one pool per non-comment line, whitespace-separated:
+#
+#   <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_slots>  [usb3]
+#
+# Fields:
+#   pool_name    free-form, used in logs only
+#   vid:pid      4-hex:4-hex (lowercase), the USB VID:PID of the device class
+#   target_vmid  the VM the devices should attach to (must be on this node)
+#   first_slot   the lowest usbN slot index the pool owns (0..14)
+#   max_slots    the upper bound on number of devices to attach simultaneously
+#                — extras beyond this count are ignored
+#   usb3         optional 6th field — pass "usb3" or "1" to force usb3=1 on
+#                attach. Omit for default (USB2 emulation).
+#
+# Behavior:
+#   - Pool fires every poll alongside the standard mapping logic.
+#   - Slots in [first_slot, first_slot+max_slots-1] that contain a non-pool
+#     entry (mapping=..., host=<vid:pid>, etc.) are LEFT ALONE. The pool only
+#     touches slots whose value is host=<bus-port> (the format it writes).
+#   - Pool entries targeting cross-node VMs are silently skipped.
+#   - On hotplug: new device matching the VID:PID attaches to the next free
+#     pool slot. On unplug: the corresponding slot is deleted from VM conf.
+#
+# Slot identity caveat: pool members are interchangeable. Slot N always
+# attaches to whichever pool device has the lowest current USB path. If you
+# unplug one and plug it into a different port, slots may shift on the next
+# poll. For most use cases (controllers, wifi adapters) that's fine.
+
+# Example: 2× SteelSeries Stratus Duo dongles (1038:1430) → VM 110 slots usb4 + usb5, USB3 enabled
+# steelseries  1038:1430  110  4  2  usb3
+
+# Example: 2× Alfa AWUS036NH USB wifi (148f:3070) — one on this host's VM 200 router
+# alfa-router  148f:3070  200  6  1
