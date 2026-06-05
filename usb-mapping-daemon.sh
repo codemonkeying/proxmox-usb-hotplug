@@ -248,6 +248,92 @@ prestrip_all_vms() {
     log "Prestrip: complete ($stripped line(s) removed)"
 }
 
+# Phantom-attach detection — runs every iteration, rate-limited internally.
+# Why this exists: when `qm start` runs while pmxcfs is wedged (or shortly
+# after pmxcfs recovery), QEMU may accept the conf's USB pass-through entries
+# and silently fail the actual host-device bind. The conf says the slot is
+# attached; QEMU's monitor disagrees; the device doesn't appear in the guest.
+# Operator's manual fix: delete the slot, let daemon re-add. This automates
+# that — query `info usb` per running VM, find usbN slots present in conf
+# but absent from QEMU's runtime, delete them, daemon re-adds next iteration.
+#
+# Today's 2026-06-05 17:00 manifestation: VM 110 boot, kb passed through
+# but mouse/bt/webcam were "fake attached" — in conf, not in QEMU. Operator
+# delete + auto re-add fixed it.
+PHANTOM_USB_INTERVAL="${PHANTOM_USB_INTERVAL:-10}"             # seconds between phantom-check scans
+PHANTOM_USB_BOOT_GRACE="${PHANTOM_USB_BOOT_GRACE:-30}"         # per-VM grace after qm start (USB enum takes a few seconds)
+PHANTOM_USB_DELETE_COOLDOWN="${PHANTOM_USB_DELETE_COOLDOWN:-60}" # per-(vmid,slot) cooldown between deletes (prevents thrash if re-add also fails)
+PHANTOM_USB_LAST_CHECK_FILE="/var/run/usb-hotplug-phantom-last-check"
+PHANTOM_USB_LAST_DELETE_DIR="/var/run/usb-hotplug-phantom-deletes"
+
+check_phantom_usb_attachments() {
+    local now=$(date +%s)
+
+    # Global rate limit
+    local last_check=0
+    [[ -f "$PHANTOM_USB_LAST_CHECK_FILE" ]] && last_check=$(cat "$PHANTOM_USB_LAST_CHECK_FILE" 2>/dev/null)
+    [[ -z "$last_check" || ! "$last_check" =~ ^[0-9]+$ ]] && last_check=0
+    if [[ $((now - last_check)) -lt "$PHANTOM_USB_INTERVAL" ]]; then
+        return 0
+    fi
+    echo "$now" > "$PHANTOM_USB_LAST_CHECK_FILE"
+    mkdir -p "$PHANTOM_USB_LAST_DELETE_DIR" 2>/dev/null
+
+    local vmid pid_file vm_start_ts conf monitor_output qmu_ids line slot
+    for vmid in $(get_running_vms); do
+        # Per-VM boot grace — QEMU's USB device enumeration takes 2-10s
+        # after qm start; checking too early gives false positives.
+        pid_file="/run/qemu-server/${vmid}.pid"
+        [[ -f "$pid_file" ]] || continue
+        vm_start_ts=$(stat -c %Y "$pid_file" 2>/dev/null)
+        [[ -z "$vm_start_ts" || ! "$vm_start_ts" =~ ^[0-9]+$ ]] && continue
+        if [[ $((now - vm_start_ts)) -lt "$PHANTOM_USB_BOOT_GRACE" ]]; then
+            continue
+        fi
+
+        conf=$(qm_config_safe "$vmid") || continue
+
+        # Snapshot QEMU's USB device list. If qm monitor returns no output
+        # at all (no "Entering QEMU Monitor" banner), the QMP socket may be
+        # wedged — skip this VM. The "info usb" output always includes the
+        # tablet ID for normal VMs, so empty-ID output is a safe abort signal.
+        monitor_output=$(timeout 5 bash -c "echo 'info usb' | qm monitor $vmid 2>/dev/null")
+        if ! grep -q "Entering QEMU Monitor" <<<"$monitor_output"; then
+            continue
+        fi
+        qmu_ids=$(grep -oE "ID: usb[0-9]+" <<<"$monitor_output" | awk '{print $2}' | sort -u)
+
+        # For each usbN slot in conf with a mapping= or host= entry, check
+        # QEMU has a matching ID. ID: usbN in qm monitor output corresponds
+        # exactly to conf slot usbN (PVE sets QEMU device id = slot name).
+        while IFS= read -r line; do
+            slot=$(sed -n 's/^\(usb[0-9]\+\):.*/\1/p' <<<"$line")
+            [[ -z "$slot" ]] && continue
+
+            if grep -qx "$slot" <<<"$qmu_ids"; then
+                continue  # attached, healthy
+            fi
+
+            # Phantom: in conf, not in QEMU. Check per-slot cooldown so we
+            # don't loop if the re-add also fails (e.g. device truly absent).
+            local cooldown_file="${PHANTOM_USB_LAST_DELETE_DIR}/${vmid}.${slot}"
+            if [[ -f "$cooldown_file" ]]; then
+                local last_delete since_delete
+                last_delete=$(cat "$cooldown_file" 2>/dev/null)
+                [[ -n "$last_delete" && "$last_delete" =~ ^[0-9]+$ ]] || last_delete=0
+                since_delete=$((now - last_delete))
+                if [[ "$since_delete" -lt "$PHANTOM_USB_DELETE_COOLDOWN" ]]; then
+                    continue
+                fi
+            fi
+
+            log "Phantom USB: ${slot} on VM ${vmid} in conf but not in QEMU runtime; deleting (daemon will re-add)"
+            with_lock qm set "$vmid" --delete "$slot" 2>&1 | logger -t usb-hotplug-phantom
+            echo "$now" > "$cooldown_file"
+        done < <(grep -E "^usb[0-9]+:[[:space:]]*(mapping=|host=)" <<<"$conf")
+    done
+}
+
 dedup_vm_mappings() {
     # Self-healing pass: scan running VMs for duplicate `mapping=X` entries
     # — multiple `usbN: mapping=X` lines referencing the SAME X. Delete all
@@ -618,6 +704,12 @@ monitor_usb_mappings() {
         # pool can't fight with a mapping that already grabbed the device on
         # this poll. Pools targeting cross-node VMs are silently skipped.
         process_pools
+
+        # Phantom USB detection — find conf slots that QEMU silently failed
+        # to bind (the "fake added" state operator hit 2026-06-05 17:00 after
+        # the boot-time pmxcfs wedge). Internally rate-limited; cheap when
+        # nothing's wrong (one qm monitor call per running VM per 10s).
+        check_phantom_usb_attachments
 
         sleep "$INTERVAL"
     done
