@@ -72,10 +72,25 @@ get_available_mappings_for_vm() {
 }
 
 mapping_already_assigned() {
+    # Returns 0 (true) if the mapping is already attached to the VM,
+    # 1 (false) if not, 0 (true / FAIL-CLOSED) if the conf can't be read
+    # reliably. The fail-closed branch matters because the caller pattern is
+    #   if ! mapping_already_assigned ... ; then add ; fi
+    # — a false-negative on partial conf read would cause duplicate adds.
+    # That's the 2026-06-05 16:12 VM 110 triple-Btooth6 incident shape.
     local vmid=$1
     local mapping=$2
     local config="/etc/pve/qemu-server/${vmid}.conf"
-    grep -q "mapping=${mapping}" "$config" 2>/dev/null
+    if [[ ! -f "$config" ]]; then
+        return 0
+    fi
+    if ! timeout 5 grep -q "^name:" "$config" 2>/dev/null; then
+        # Conf read timed out, file empty, or no name field — pmxcfs is
+        # serving partial data. Fail closed: pretend it's already there so
+        # we don't add a duplicate.
+        return 0
+    fi
+    grep -qE "^usb[0-9]+:[[:space:]]*mapping=${mapping}([,[:space:]]|$)" "$config" 2>/dev/null
 }
 
 add_mapping_to_vm() {
@@ -162,6 +177,134 @@ add_available_mappings_to_config() {
     return $added_count
 }
 
+# ---------------------------------------------------------------------------
+# PCI mappings — conditional attachment for hostpci passthrough
+# ---------------------------------------------------------------------------
+# Mirrors the USB pattern: shared-* mappings get attached to whichever VM
+# start.sh is launching IF the device is present on this node. vm${VMID}-*
+# mappings only attach to that specific VMID. Mappings tagged with a different
+# node= are ignored.
+#
+# Use case: PCI devices that are optional/portable (e.g. TBT3 dock USB
+# controller) — present on the laptop most of the time but the VM should still
+# start if the device is missing. This is in contrast to baked-in statics like
+# hostpci0 (GPU) that the VM hard-depends on.
+
+PCI_MAPPING_CONFIG="/etc/pve/mapping/pci.cfg"
+
+# Parse /etc/pve/mapping/pci.cfg into "mapping|id|description|node|iommugroup|path"
+# lines. Same shape as get_usb_mappings, just with two extra fields for PCI.
+get_pci_mappings() {
+    [[ -f "$PCI_MAPPING_CONFIG" ]] || return 1
+
+    local mapping="" id="" node="" iommugroup="" path="" description=""
+
+    flush() {
+        if [[ -n "$mapping" && -n "$id" && -n "$path" ]]; then
+            echo "${mapping}|${id}|${description:-$mapping}|${node}|${iommugroup}|${path}"
+        fi
+        mapping=""; id=""; node=""; iommugroup=""; path=""; description=""
+    }
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            flush
+            mapping="$line"
+        elif [[ "$line" =~ ^[[:space:]]+map[[:space:]] ]]; then
+            [[ "$line" =~ id=([^,[:space:]]+) ]] && id="${BASH_REMATCH[1]}"
+            [[ "$line" =~ node=([^,[:space:]]+) ]] && node="${BASH_REMATCH[1]}"
+            [[ "$line" =~ iommugroup=([^,[:space:]]+) ]] && iommugroup="${BASH_REMATCH[1]}"
+            [[ "$line" =~ path=([^,[:space:]]+) ]] && path="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+description[[:space:]]+(.*)$ ]]; then
+            description="${BASH_REMATCH[1]}"
+        fi
+    done < "$PCI_MAPPING_CONFIG"
+    flush
+}
+
+# Filter PCI mappings to those applicable to $vmid on this host AND whose
+# device is actually present (in lspci output). Returns "mapping|id|description|path"
+# (path is needed because the helper writes `hostpci<N>: mapping=NAME` — but
+# we may want path-based diagnostics).
+get_available_pci_mappings_for_vm() {
+    local vmid=$1
+    local hostname=$(hostname)
+    # lspci shows the device regardless of driver binding (xhci_hcd OR vfio-pci),
+    # so this works even if a prior VM session left it on vfio-pci.
+    # `lspci -n` output: "BDF CLASS: VID:PID (rev XX)" — column 3 is what we want.
+    local current_pci=$(lspci -n | awk '{print $3}')
+
+    get_pci_mappings | while IFS='|' read -r mapping id description node iommugroup path; do
+        # Skip mappings registered to a different node.
+        if [[ -n "$node" && "$node" != "$hostname" ]]; then
+            continue
+        fi
+        # Device must actually be present. We match on VID:PID since lspci ids
+        # are what we have; path could be checked too but it's more brittle.
+        if ! echo "$current_pci" | grep -qx "$id"; then
+            continue
+        fi
+        # Only shared-* and vm${vmid}-* mappings are eligible. Other mappings
+        # (e.g. pvep16_A4500GPU) are hardcoded in the profile config and must
+        # not be double-added.
+        if [[ "$mapping" =~ ^vm${vmid}- ]] || [[ "$mapping" =~ ^shared- ]]; then
+            echo "${mapping}|${id}|${description}|${path}"
+        fi
+    done
+}
+
+# Add available PCI mappings to $config_file as `hostpci<N>: mapping=NAME,pcie=1`.
+# Slot search starts at 0 and finds the first unused hostpciN (PVE supports 0..15).
+# Skips a mapping if it's already present in the config.
+add_available_pci_mappings_to_config() {
+    local vmid=$1
+    local config_file=$2
+
+    if is_vm_protected "$vmid"; then
+        echo "VM $vmid is protected from PCI auto-attach"
+        return 0
+    fi
+
+    echo "Detecting available PCI device mappings for VM $vmid..."
+
+    local added_count=0
+
+    while IFS='|' read -r mapping id description path; do
+        [[ -z "$mapping" ]] && continue
+
+        # Skip if this mapping is already in the config (matches both
+        # `hostpci<N>: mapping=NAME` and possible `hostpci<N>: mapping=NAME,...`).
+        if grep -qE "^hostpci[0-9]+:[[:space:]]*mapping=${mapping}([,[:space:]]|\$)" "$config_file"; then
+            echo "PCI mapping $mapping already in config — skipping"
+            continue
+        fi
+
+        local slot=""
+        for i in {0..15}; do
+            if ! grep -qE "^hostpci${i}:" "$config_file"; then
+                slot=$i
+                break
+            fi
+        done
+
+        if [[ -n "$slot" ]]; then
+            echo "hostpci${slot}: mapping=${mapping},pcie=1" >> "$config_file"
+            echo "Added PCI mapping: $description ($mapping, $path) as hostpci${slot}"
+            ((added_count++))
+        else
+            echo "No available hostpci slots (0-15 all in use) for: $description ($mapping)"
+        fi
+    done < <(get_available_pci_mappings_for_vm "$vmid")
+
+    if [[ $added_count -gt 0 ]]; then
+        echo "Added $added_count PCI device mapping(s) to config"
+    else
+        echo "No additional PCI device mappings available"
+    fi
+
+    return 0
+}
+
 add_protected_vm() {
     local vmid=$1
     echo "$vmid" >> "$PROTECTED_VMS_CONFIG"
@@ -214,6 +357,34 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 exit 1
             fi
             add_available_mappings_to_config "$vmid" "$config_file"
+            ;;
+        "list-pci-mappings")
+            echo "Available PCI device mappings:"
+            get_pci_mappings | while IFS='|' read -r mapping id description node iommugroup path; do
+                echo "  $mapping: $id @ $path (iommugroup=${iommugroup}, node=${node:-any})"
+                [[ -n "$description" && "$description" != "$mapping" ]] && echo "      $description"
+            done
+            ;;
+        "list-available-pci")
+            vmid="${2:-}"
+            if [[ -z "$vmid" ]]; then
+                echo "Usage: $0 list-available-pci VMID"
+                exit 1
+            fi
+            echo "Available PCI mappings for VM $vmid on this node:"
+            get_available_pci_mappings_for_vm "$vmid" | while IFS='|' read -r mapping id description path; do
+                echo "  $mapping: $id @ $path"
+                [[ -n "$description" && "$description" != "$mapping" ]] && echo "      $description"
+            done
+            ;;
+        "add-pci-mappings")
+            vmid="${2:-}"
+            config_file="${3:-}"
+            if [[ -z "$vmid" ]] || [[ -z "$config_file" ]]; then
+                echo "Usage: $0 add-pci-mappings VMID CONFIG_FILE"
+                exit 1
+            fi
+            add_available_pci_mappings_to_config "$vmid" "$config_file"
             ;;
         "protect")
             vmid="${2:-}"

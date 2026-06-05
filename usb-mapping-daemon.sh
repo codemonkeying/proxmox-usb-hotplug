@@ -45,6 +45,31 @@ vm_running() {
     qm status "$vmid" 2>/dev/null | grep -q "status: running"
 }
 
+# qm_config_safe — read a VM's config with a timeout AND sanity-check the
+# output. Returns the config text on stdout and 0 on success; empty stdout
+# and nonzero exit on timeout, error, or partial output. Use whenever the
+# daemon needs to TRUST the contents (dedup, slot scans, mapping presence).
+#
+# A bare `qm config` can return EMPTY or partial output when pmxcfs is
+# mid-rebuild after a corosync membership change — the conf file is served
+# locally but the cluster-sync layer may not have merged peer state yet.
+# This was the 2026-06-05 16:12 root cause: daemon's pre-add dedup check
+# at 16:12:41 (22s after corosync restart by Job 3) read VM 110's conf as
+# (apparently) missing the usb3/usb6 shared-Btooth6 entries that were
+# actually there, then added shared-Btooth6 again at usb7. Operator saw
+# three slots all pointing to the same physical bluetooth dongle.
+#
+# Sanity gate: every valid VM conf has a `name:` field. If absent, the
+# read returned partial/stale data — fail closed, caller skips this iter.
+qm_config_safe() {
+    local vmid=$1
+    local out
+    out=$(timeout 10 qm config "$vmid" 2>/dev/null) || return 1
+    [[ -z "$out" ]] && return 1
+    grep -q "^name:" <<<"$out" || return 1
+    printf '%s\n' "$out"
+}
+
 get_gpu_vm() {
     [[ -z "$GPU_MAPPING" ]] && return 1
     for vm in $(qm list | awk 'NR>1 && $3=="running" {print $1}'); do
@@ -77,13 +102,24 @@ add_mapping_to_running_vm() {
 
     vm_running "$vmid" || return 1
 
-    if qm config "$vmid" 2>/dev/null | grep -q "mapping=${mapping}"; then
+    # Read conf ONCE with safety check. If the read returns partial/empty,
+    # defer — we won't risk adding a duplicate slot based on bad data.
+    local conf
+    conf=$(qm_config_safe "$vmid") || {
+        log "add_mapping_to_running_vm: VM $vmid qm config read unreliable; deferring add of $mapping"
+        return 1
+    }
+
+    # Anchored regex — exact mapping name match (avoids prefix collisions
+    # like mapping=shared-bt vs mapping=shared-bt-2). Scans ALL usb slots,
+    # so a stale entry from a prior boot at any slot prevents a duplicate.
+    if grep -qE "^usb[0-9]+:[[:space:]]*mapping=${mapping}([,[:space:]]|$)" <<<"$conf"; then
         return 0
     fi
 
     local slot=""
     for i in {0..14}; do
-        if ! qm config "$vmid" 2>/dev/null | grep -q "^usb${i}:"; then
+        if ! grep -qE "^usb${i}:" <<<"$conf"; then
             slot=$i
             break
         fi
@@ -97,7 +133,14 @@ add_mapping_to_running_vm() {
     log "Adding USB mapping $mapping ($description) to VM $vmid as usb${slot}"
 
     if with_lock qm set "$vmid" -usb${slot} "mapping=${mapping},usb3=1"; then
-        if qm config "$vmid" 2>/dev/null | grep -q "mapping=${mapping}"; then
+        # Re-read after set — verify the new line landed on the slot we asked for.
+        local conf_after
+        conf_after=$(qm_config_safe "$vmid") || {
+            log "add_mapping_to_running_vm: post-set read failed for VM $vmid mapping $mapping; assuming success"
+            echo "${mapping}:${vmid}" >> "$STATE_FILE"
+            return 0
+        }
+        if grep -qE "^usb${slot}:[[:space:]]*mapping=${mapping}([,[:space:]]|$)" <<<"$conf_after"; then
             log "Successfully added mapping $mapping to VM $vmid"
             echo "${mapping}:${vmid}" >> "$STATE_FILE"
             return 0
@@ -203,6 +246,34 @@ prestrip_all_vms() {
         done < <(grep -E "^usb[0-9]+:[[:space:]]*mapping=" "$config")
     done
     log "Prestrip: complete ($stripped line(s) removed)"
+}
+
+dedup_vm_mappings() {
+    # Self-healing pass: scan running VMs for duplicate `mapping=X` entries
+    # — multiple `usbN: mapping=X` lines referencing the SAME X. Delete all
+    # but the lowest-numbered slot. Cleans up legacy duplicates from before
+    # qm_config_safe + the tightened pre-add check were in place, and any
+    # future ones if a partial-read race still slips past the safe reader.
+    # Idempotent and cheap: when no duplicates exist (the steady state) it
+    # does nothing past the conf read + parse.
+    local vmid conf line slot mapping first_slot
+    for vmid in $(get_running_vms); do
+        conf=$(qm_config_safe "$vmid") || continue
+        declare -A seen=()
+        while IFS= read -r line; do
+            slot=$(sed -n 's/^usb\([0-9]\+\):.*/\1/p' <<<"$line")
+            mapping=$(sed -n 's/.*mapping=\([a-zA-Z0-9_-]*\).*/\1/p' <<<"$line")
+            [[ -z "$slot" || -z "$mapping" ]] && continue
+            if [[ -n "${seen[$mapping]:-}" ]]; then
+                first_slot="${seen[$mapping]}"
+                log "Dedup: removing duplicate usb${slot} mapping=${mapping} from VM ${vmid} (kept at usb${first_slot})"
+                with_lock qm set "$vmid" --delete "usb${slot}" 2>&1 | logger -t usb-hotplug-dedup
+            else
+                seen[$mapping]=$slot
+            fi
+        done < <(grep -E "^usb[0-9]+:[[:space:]]*mapping=" <<<"$conf" | sort -t: -k1.4n)
+        unset seen
+    done
 }
 
 cleanup_pci_passthrough_conflicts() {
@@ -436,6 +507,7 @@ monitor_usb_mappings() {
             log "Running VMs: $running_vms"
             last_running_vms="$running_vms"
             cleanup_pci_passthrough_conflicts
+            dedup_vm_mappings
         fi
 
         # Debounce GPU VM disappearance — two cases:
