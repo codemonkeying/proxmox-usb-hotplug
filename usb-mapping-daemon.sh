@@ -70,6 +70,104 @@ qm_config_safe() {
     printf '%s\n' "$out"
 }
 
+# v2 (2026-06-08 night) — pmxcfs LIMBO gate.
+# Returns 0 if pmxcfs appears healthy, 1 if in LIMBO (read-only or .version
+# EIO/EAGAIN). Cheap to call — two stat-class operations. Use as the FIRST
+# check at the top of every main-loop iteration so we don't issue any writes
+# while pmxcfs is mid-resync (the underlying cause of Failure Mode B's
+# write-success-but-read-stale state, per pve-cluster source + research).
+pmxcfs_limbo_check() {
+    local mount_opts
+    mount_opts=$(findmnt -n -o OPTIONS /etc/pve 2>/dev/null)
+    # ro indicates pmxcfs is in read-only / no-quorum state.
+    [[ "$mount_opts" == *"ro,"* || "$mount_opts" == *",ro"* ]] && return 1
+    # .version stat will EIO/EAGAIN during CPG mid-resync.
+    stat /etc/pve/.version >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# v2 — read the JSON `vmlist` counter from /etc/pve/.version. Increments by
+# multiple ticks for every qm/pvesh write that touches a VM conf. Use as a
+# barrier: capture before a write, expect a higher value after; if unchanged
+# the write either didn't propagate locally or was clobbered by a concurrent
+# write. Returns empty string on read failure.
+get_vmlist_seq() {
+    local v
+    v=$(grep -o '"vmlist":[[:space:]]*[0-9]\+' /etc/pve/.version 2>/dev/null | grep -o '[0-9]\+$')
+    echo "${v:-}"
+}
+
+# v2 — pvesh batch helpers. Accumulate add/delete ops during the main loop;
+# at end of iteration, issue ONE pvesh set per VM (multiple --usbN flags +
+# comma-delimited --delete). This converts the "dock-unplug storm" pattern
+# (4-5 strips in 2s) from 4-5 separate qm set calls into 1 atomic pvesh
+# request = 1 CPG broadcast = 1 file write. Reduces race surface; doesn't
+# eliminate it (QMP device_add still iterated serially per slot inside PVE).
+declare -a BATCH_VM=()
+declare -a BATCH_FLAG=()
+declare -a BATCH_VAL=()
+
+batch_queue_add() {
+    local vmid=$1 slot=$2 mapping=$3
+    BATCH_VM+=("$vmid")
+    BATCH_FLAG+=("--usb${slot}")
+    BATCH_VAL+=("mapping=${mapping},usb3=1")
+}
+
+batch_queue_delete() {
+    local vmid=$1 slot=$2
+    BATCH_VM+=("$vmid")
+    BATCH_FLAG+=("--delete")
+    BATCH_VAL+=("usb${slot}")
+}
+
+batch_flush() {
+    [[ ${#BATCH_VM[@]} -eq 0 ]] && return 0
+
+    # Group ops by VM. For each VM: one pvesh call with all flags.
+    local -A vm_seen=()
+    local i
+    for ((i=0; i<${#BATCH_VM[@]}; i++)); do
+        vm_seen[${BATCH_VM[$i]}]=1
+    done
+
+    local vmid
+    for vmid in "${!vm_seen[@]}"; do
+        local args=()
+        local deletes_csv=""
+        for ((i=0; i<${#BATCH_VM[@]}; i++)); do
+            [[ "${BATCH_VM[$i]}" != "$vmid" ]] && continue
+            if [[ "${BATCH_FLAG[$i]}" == "--delete" ]]; then
+                # Coalesce all deletes into one comma-list for this VM.
+                if [[ -z "$deletes_csv" ]]; then
+                    deletes_csv="${BATCH_VAL[$i]}"
+                else
+                    deletes_csv="${deletes_csv},${BATCH_VAL[$i]}"
+                fi
+            else
+                args+=("${BATCH_FLAG[$i]}" "${BATCH_VAL[$i]}")
+            fi
+        done
+        [[ -n "$deletes_csv" ]] && args+=(--delete "$deletes_csv")
+
+        local before after
+        before=$(get_vmlist_seq)
+        log "pvesh batch flush VM $vmid: ${args[*]}"
+        if with_lock pvesh set "/nodes/$(hostname)/qemu/${vmid}/config" "${args[@]}" 2>&1 | tee -a "$LOG_FILE" >/dev/null ; then
+            after=$(get_vmlist_seq)
+            if [[ -n "$before" && -n "$after" && "$after" -le "$before" ]]; then
+                log "pvesh batch flush VM $vmid: vmlist counter did not advance ($before -> $after) — write may not have propagated locally"
+            fi
+        else
+            log "pvesh batch flush VM $vmid: FAILED — ops will retry next iteration"
+        fi
+    done
+
+    BATCH_VM=()
+    BATCH_FLAG=()
+    BATCH_VAL=()
+}
+
 get_gpu_vm() {
     [[ -z "$GPU_MAPPING" ]] && return 1
     for vm in $(qm list | awk 'NR>1 && $3=="running" {print $1}'); do
@@ -586,6 +684,15 @@ monitor_usb_mappings() {
     log "Boot grace: ${BOOT_GRACE_SECONDS}s suppressing cleanup until GPU VM appears (avoids stripping shared-* before pve-guests starts VM 110)"
 
     while true; do
+        # v2 — LIMBO gate. If pmxcfs is mid-resync (cluster membership change
+        # in progress, or partial CPG state), back off without any writes.
+        # Avoids issuing pvesh/qm-set calls into the stale-read window.
+        if ! pmxcfs_limbo_check; then
+            log "pmxcfs LIMBO (mount RO or .version unreadable) — backing off ${INTERVAL}s"
+            sleep "$INTERVAL"
+            continue
+        fi
+
         local running_vms=$(get_running_vms | tr '\n' ' ')
         local gpu_vm=$(get_gpu_vm)
 
@@ -684,15 +791,54 @@ monitor_usb_mappings() {
             fi
 
             if echo "$current_devices" | grep -q "^${device_id}$"; then
-                # Device present — can only attach to a running VM.
+                # Device present — can only attach to a running VM. Use batch
+                # queue: each iteration accumulates adds/deletes and flushes
+                # ONE pvesh call per VM at end. Avoids the dock-unplug-storm
+                # pattern (4-5 individual qm sets in 2s) from racing inside
+                # pmxcfs.
                 if vm_running "$target_vm" && ! mapping_already_assigned "$target_vm" "$mapping"; then
-                    add_mapping_to_running_vm "$target_vm" "$mapping" "$device_id" "$description"
+                    # Find free slot considering both live conf AND already-queued ops.
+                    local conf_path="/etc/pve/qemu-server/${target_vm}.conf"
+                    local slot=""
+                    for i in {0..14}; do
+                        if grep -q "^usb${i}:" "$conf_path"; then continue; fi
+                        # Skip if already queued for this VM in this iteration.
+                        local queued=0
+                        local j
+                        for ((j=0; j<${#BATCH_VM[@]}; j++)); do
+                            if [[ "${BATCH_VM[$j]}" == "$target_vm" && "${BATCH_FLAG[$j]}" == "--usb${i}" ]]; then
+                                queued=1; break
+                            fi
+                        done
+                        [[ $queued -eq 0 ]] && { slot=$i; break; }
+                    done
+                    if [[ -n "$slot" ]]; then
+                        log "Queue add: VM $target_vm mapping=$mapping at usb${slot} (id=$device_id)"
+                        batch_queue_add "$target_vm" "$slot" "$mapping"
+                        # Update state file optimistically (legacy convention).
+                        echo "${mapping}:${target_vm}" >> "$STATE_FILE"
+                    else
+                        log "No free slot for $mapping on VM $target_vm (conf+batch both full)"
+                    fi
                 fi
             else
                 # Device absent — strip ghost mapping regardless of VM state.
+                # Running VM: queue for batch (pvesh handles --delete cleanly
+                # whether running or stopped). Stopped VM: direct conf sed
+                # because pvesh on stopped VMs can't unstage usbN entries
+                # that QEMU never registered (legacy remove_mapping_from_stopped_vm
+                # handles this via sed).
                 if mapping_already_assigned "$target_vm" "$mapping"; then
                     if vm_running "$target_vm"; then
-                        remove_mapping_from_running_vm "$target_vm" "$mapping"
+                        local conf_path="/etc/pve/qemu-server/${target_vm}.conf"
+                        local slot
+                        slot=$(grep -E "^usb[0-9]+:[[:space:]]*mapping=${mapping}([,[:space:]]|$)" "$conf_path" \
+                               | sed -n 's/^usb\([0-9]\+\):.*/\1/p' | head -1)
+                        if [[ -n "$slot" ]]; then
+                            log "Queue delete: VM $target_vm usb${slot} (was $mapping)"
+                            batch_queue_delete "$target_vm" "$slot"
+                            sed -i "/${mapping}:${target_vm}/d" "$STATE_FILE" 2>/dev/null
+                        fi
                     else
                         remove_mapping_from_stopped_vm "$target_vm" "$mapping"
                     fi
@@ -700,9 +846,15 @@ monitor_usb_mappings() {
             fi
         done
 
+        # v2 — flush the batched ops as one pvesh call per affected VM. This
+        # is the dock-unplug-storm mitigation point.
+        batch_flush
+
         # Pools (multi-device plug-anywhere) — runs after mapping logic so a
         # pool can't fight with a mapping that already grabbed the device on
         # this poll. Pools targeting cross-node VMs are silently skipped.
+        # NOTE: pools still use the legacy qm-set path. Could be migrated to
+        # batch later if pool churn proves to be a contention source.
         process_pools
 
         # Phantom USB detection — find conf slots that QEMU silently failed

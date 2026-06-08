@@ -4,6 +4,27 @@
 MAPPING_CONFIG="/etc/pve/mapping/usb.cfg"
 PROTECTED_VMS_CONFIG="/etc/usb-hotplug-protected-vms.conf"
 
+# safe_append_conf — append a config line to a PVE conf file, ensuring the
+# destination file ends with a newline FIRST. Without this guard, a profile
+# file that's missing a trailing newline (vim with `endofline` off, git diff
+# artifact, hand-edit, etc.) causes the appended line to be glued onto the
+# previous line. Caught 2026-06-08 night: 110_auto.conf had no trailing
+# newline; helper appended "usb0: ..." onto the end of "vmgenid: <guid>" →
+# QEMU saw "vmgenid,guid=<guid>usb0: mapping=..." and bailed with exit 1.
+# Use this anywhere a `>> "$file"` append would be unsafe.
+safe_append_conf() {
+    local line=$1
+    local file=$2
+    if [[ -s "$file" ]]; then
+        local last
+        last=$(tail -c1 "$file" | od -An -tx1 | tr -d ' \n')
+        if [[ "$last" != "0a" ]]; then
+            printf '\n' >> "$file"
+        fi
+    fi
+    printf '%s\n' "$line" >> "$file"
+}
+
 # Parse /etc/pve/mapping/usb.cfg into "mapping|device_id|description|node" lines.
 # Format in source file:
 #   mapping-name
@@ -111,7 +132,7 @@ add_mapping_to_vm() {
     done
 
     if [[ -n "$slot" ]]; then
-        echo "usb${slot}: mapping=${mapping},usb3=1" >> "$config"
+        safe_append_conf "usb${slot}: mapping=${mapping},usb3=1" "$config"
         echo "Added USB mapping: $description ($mapping) as usb${slot}"
         return 0
     else
@@ -160,7 +181,7 @@ add_available_mappings_to_config() {
         done
 
         if [[ -n "$slot" ]]; then
-            echo "usb${slot}: mapping=${mapping},usb3=1" >> "$config_file"
+            safe_append_conf "usb${slot}: mapping=${mapping},usb3=1" "$config_file"
             echo "Added USB mapping: $description ($mapping) as usb${slot}"
             ((added_count++))
         else
@@ -288,7 +309,7 @@ add_available_pci_mappings_to_config() {
         done
 
         if [[ -n "$slot" ]]; then
-            echo "hostpci${slot}: mapping=${mapping},pcie=1" >> "$config_file"
+            safe_append_conf "hostpci${slot}: mapping=${mapping},pcie=1" "$config_file"
             echo "Added PCI mapping: $description ($mapping, $path) as hostpci${slot}"
             ((added_count++))
         else
