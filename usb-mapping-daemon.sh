@@ -630,38 +630,56 @@ process_pools() {
         local conf_snapshot
         conf_snapshot=$(qm config "$vmid" 2>/dev/null) || continue
 
-        local i slot current_path current_conf desired
+        # Two-pass slot assignment (2026-06-08 night): the old loop did a fixed
+        # paths[i] -> slot[first_slot+i] mapping. If any slot in the range was
+        # occupied by a non-pool entry (e.g. a shared-* mapping landed there),
+        # the paths assigned to that index were dropped on the floor — leaving
+        # an identical-VID:PID device unattached. New flow:
+        #   Pass 1: determine which slots in [first_slot, first_slot+max_slots)
+        #           are usable (empty OR currently holding a pool entry).
+        #   Pass 2: zip paths -> usable_slots in order, log when paths exceed
+        #           usable slots, detach pool ghosts in usable slots without a path.
+        local i slot current_conf
+        local -a usable_slots=()
         for ((i=0; i<max_slots; i++)); do
             slot=$((first_slot + i))
-            current_path="${paths[i]:-}"
             current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
-
-            if [[ -n "$current_path" ]]; then
-                desired="host=${current_path}${usb3_arg}"
-                if [[ "$current_conf" == "$desired" ]]; then
-                    continue  # already correct
-                fi
-
-                if [[ -n "$current_conf" ]]; then
-                    # Existing slot occupied — only overwrite if it's a pool-
-                    # managed value (host=<bus-port>). Leave mappings + host=<vid:pid>
-                    # entries alone.
-                    if [[ "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
-                        log "pool $pool_name: VM $vmid usb${slot} path drift -> $current_path"
-                        with_lock qm set "$vmid" "--usb${slot}" "$desired" 2>&1 | logger -t usb-hotplug-pool
-                    else
-                        log "pool $pool_name: VM $vmid usb${slot} occupied by non-pool entry (${current_conf}); skipping"
-                    fi
-                else
-                    log "pool $pool_name: attach VM $vmid usb${slot} -> $current_path"
-                    with_lock qm set "$vmid" "--usb${slot}" "$desired" 2>&1 | logger -t usb-hotplug-pool
-                fi
+            if [[ -z "$current_conf" || "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
+                usable_slots+=("$slot")
             else
-                # No device for this slot index — strip pool-owned ghosts only.
-                if [[ -n "$current_conf" && "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
-                    log "pool $pool_name: detach VM $vmid usb${slot} (device gone)"
-                    with_lock qm set "$vmid" "--delete" "usb${slot}" 2>&1 | logger -t usb-hotplug-pool
-                fi
+                log "pool $pool_name: VM $vmid usb${slot} occupied by non-pool entry (${current_conf}); skipping"
+            fi
+        done
+
+        local current_path desired
+        local -A path_assigned=()
+        for ((i=0; i<${#paths[@]}; i++)); do
+            if [[ "$i" -ge "${#usable_slots[@]}" ]]; then
+                log "pool $pool_name: no usable slot for path ${paths[i]} (pool range exhausted — bump max_slots or move first_slot)"
+                continue
+            fi
+            slot="${usable_slots[i]}"
+            current_path="${paths[i]}"
+            desired="host=${current_path}${usb3_arg}"
+            current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
+            path_assigned[$slot]=1
+            if [[ "$current_conf" == "$desired" ]]; then
+                continue
+            fi
+            if [[ -n "$current_conf" ]]; then
+                log "pool $pool_name: VM $vmid usb${slot} path drift -> $current_path"
+            else
+                log "pool $pool_name: attach VM $vmid usb${slot} -> $current_path"
+            fi
+            with_lock qm set "$vmid" "--usb${slot}" "$desired" 2>&1 | logger -t usb-hotplug-pool
+        done
+
+        for slot in "${usable_slots[@]}"; do
+            [[ -n "${path_assigned[$slot]:-}" ]] && continue
+            current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
+            if [[ -n "$current_conf" && "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
+                log "pool $pool_name: detach VM $vmid usb${slot} (device gone)"
+                with_lock qm set "$vmid" "--delete" "usb${slot}" 2>&1 | logger -t usb-hotplug-pool
             fi
         done
     done < "$POOLS_CONF"
