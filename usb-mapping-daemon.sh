@@ -780,7 +780,14 @@ monitor_usb_mappings() {
         local current_devices=$(lsusb | awk '{print $6}')
         local hostname=$(hostname)
 
-        get_usb_mappings | while IFS='|' read -r mapping device_id description node; do
+        # IMPORTANT: process substitution `< <(...)` keeps the while body in
+        # the parent shell so batch_queue_add's appends to BATCH_VM/FLAG/VAL
+        # persist into batch_flush below. The old `get_usb_mappings | while`
+        # pipe put the loop in a subshell — batch_queue_add updates died with
+        # it and batch_flush always saw an empty queue (no pvesh set ever
+        # ran). Same pattern already used by prestrip_all_vms (line ~217)
+        # and dedup_vm_mappings (~409).
+        while IFS='|' read -r mapping device_id description node; do
             if [[ "$mapping" =~ ^disabled- ]]; then
                 continue
             fi
@@ -862,7 +869,7 @@ monitor_usb_mappings() {
                     fi
                 fi
             fi
-        done
+        done < <(get_usb_mappings)
 
         # v2 — flush the batched ops as one pvesh call per affected VM. This
         # is the dock-unplug-storm mitigation point.
