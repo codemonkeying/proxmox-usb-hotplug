@@ -61,10 +61,22 @@ vm_running() {
 #
 # Sanity gate: every valid VM conf has a `name:` field. If absent, the
 # read returned partial/stale data — fail closed, caller skips this iter.
+#
+# Second arg "live" → pass `--current 1` to exclude [PENDING] entries.
+# Why: bare `qm config` returns the PENDING merged view (= "what the VM
+# will look like after next restart"). The phantom-USB check needs the
+# LIVE running view — without --current 1 it would treat any pending USB
+# entry as a phantom (mapping daemon added via pvesh, PVE moved to
+# [PENDING] because hot-add can't synthesize a missing xhci controller),
+# delete it, the mapping logic re-adds it → infinite oscillation. Other
+# callers (add/remove paths) want the pending view to avoid duplicates,
+# so default behaviour is unchanged.
 qm_config_safe() {
     local vmid=$1
+    local extra=()
+    [[ "${2:-}" == "live" ]] && extra=(--current 1)
     local out
-    out=$(timeout 10 qm config "$vmid" 2>/dev/null) || return 1
+    out=$(timeout 10 qm config "$vmid" "${extra[@]}" 2>/dev/null) || return 1
     [[ -z "$out" ]] && return 1
     grep -q "^name:" <<<"$out" || return 1
     printf '%s\n' "$out"
@@ -389,7 +401,14 @@ check_phantom_usb_attachments() {
             continue
         fi
 
-        conf=$(qm_config_safe "$vmid") || continue
+        # LIVE-only view — exclude [PENDING] entries. A pending USB slot
+        # isn't a phantom; PVE just couldn't hot-add it (e.g. running QEMU
+        # has no xhci controller, so a USB 3.0 device gets queued for the
+        # next restart). Without this, the daemon would delete the pending
+        # slot, its mapping logic would re-add it, PVE would re-queue, and
+        # the cycle would repeat every PHANTOM_USB_DELETE_COOLDOWN seconds
+        # forever.
+        conf=$(qm_config_safe "$vmid" live) || continue
 
         # Snapshot QEMU's USB device list. If qm monitor returns no output
         # at all (no "Entering QEMU Monitor" banner), the QMP socket may be
