@@ -107,11 +107,69 @@ declare -a BATCH_VM=()
 declare -a BATCH_FLAG=()
 declare -a BATCH_VAL=()
 
+# vm_has_xhci — true iff VM's running QEMU has a qemu-xhci controller.
+# PVE adds qemu-xhci at VM start ONLY when the conf contains any usb device
+# at that moment. If the VM was started with no usbN entries (e.g. daemon
+# had just deleted one via phantom-check right before a qmeventd restart),
+# QEMU has no xhci bus. Adding "usb3=1" devices later silently fails — the
+# QMP device_add targets a non-existent bus, pvesh returns 0, runtime stays
+# empty, phantom-check fires, re-add fails again. Vicious loop.
+#
+# Result is cached per-VM keyed on the pid file mtime (= VM start time).
+# Invalidation on restart is automatic since the cache key changes.
+declare -A XHCI_CACHE_KEY=()
+declare -A XHCI_CACHE_VAL=()
+vm_has_xhci() {
+    local vmid=$1
+    local pid_file="/run/qemu-server/${vmid}.pid"
+    [[ -f "$pid_file" ]] || return 1
+    local key
+    key=$(stat -c %Y "$pid_file" 2>/dev/null)
+    [[ -z "$key" ]] && return 1
+    if [[ "${XHCI_CACHE_KEY[$vmid]}" == "$key" ]]; then
+        [[ "${XHCI_CACHE_VAL[$vmid]}" == "1" ]] && return 0 || return 1
+    fi
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    [[ -z "$pid" || ! -r "/proc/$pid/cmdline" ]] && return 1
+    local has=0
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "qemu-xhci"; then
+        has=1
+    fi
+    XHCI_CACHE_KEY[$vmid]="$key"
+    XHCI_CACHE_VAL[$vmid]="$has"
+    [[ "$has" == "1" ]]
+}
+
+# usb3_arg_for — return ",usb3=1" if VM has xhci, empty otherwise. Empty
+# means the device attaches to the always-present piix3-uhci (USB 1.1, 12
+# Mbps) which is fine for low-speed devices but cripples high-speed ones.
+# Adding it anyway is still better than the alternative (silent re-add loop)
+# because (a) UHCI attach actually succeeds at runtime so phantom-check is
+# quiet, and (b) operator sees a "VM N has no xhci" warning to act on.
+usb3_arg_for() {
+    local vmid=$1
+    if vm_has_xhci "$vmid"; then
+        echo ",usb3=1"
+    else
+        # Rate-limited warning: once per (vmid, VM-start-epoch).
+        local pid_file="/run/qemu-server/${vmid}.pid"
+        local key warn_file
+        key=$(stat -c %Y "$pid_file" 2>/dev/null)
+        warn_file="/var/run/usb-hotplug-noxhci-warned.${vmid}.${key}"
+        if [[ ! -f "$warn_file" ]]; then
+            log "WARN: VM $vmid has no qemu-xhci controller (started with no USB devices in conf). Falling back to usb3=0 (UHCI = USB 1.1). High-speed devices like RT5370/MT7921u will not work at full speed. Restart VM with at least one usbN entry in conf to get xhci."
+            touch "$warn_file" 2>/dev/null
+        fi
+        echo ""
+    fi
+}
+
 batch_queue_add() {
     local vmid=$1 slot=$2 mapping=$3
     BATCH_VM+=("$vmid")
     BATCH_FLAG+=("--usb${slot}")
-    BATCH_VAL+=("mapping=${mapping},usb3=1")
+    BATCH_VAL+=("mapping=${mapping}$(usb3_arg_for "$vmid")")
 }
 
 batch_queue_delete() {
@@ -230,7 +288,7 @@ add_mapping_to_running_vm() {
 
     log "Adding USB mapping $mapping ($description) to VM $vmid as usb${slot}"
 
-    if with_lock qm set "$vmid" -usb${slot} "mapping=${mapping},usb3=1"; then
+    if with_lock qm set "$vmid" -usb${slot} "mapping=${mapping}$(usb3_arg_for "$vmid")"; then
         # Re-read after set — verify the new line landed on the slot we asked for.
         local conf_after
         conf_after=$(qm_config_safe "$vmid") || {
@@ -361,8 +419,10 @@ prestrip_all_vms() {
 PHANTOM_USB_INTERVAL="${PHANTOM_USB_INTERVAL:-10}"             # seconds between phantom-check scans
 PHANTOM_USB_BOOT_GRACE="${PHANTOM_USB_BOOT_GRACE:-30}"         # per-VM grace after qm start (USB enum takes a few seconds)
 PHANTOM_USB_DELETE_COOLDOWN="${PHANTOM_USB_DELETE_COOLDOWN:-60}" # per-(vmid,slot) cooldown between deletes (prevents thrash if re-add also fails)
+PHANTOM_USB_MAX_RETRIES="${PHANTOM_USB_MAX_RETRIES:-5}"        # after N consecutive failed re-adds, stop deleting + log loud (prevents host-xhci poisoning from cycle storm)
 PHANTOM_USB_LAST_CHECK_FILE="/var/run/usb-hotplug-phantom-last-check"
 PHANTOM_USB_LAST_DELETE_DIR="/var/run/usb-hotplug-phantom-deletes"
+PHANTOM_USB_RETRY_DIR="/var/run/usb-hotplug-phantom-retries"   # per-(vmid,slot) consecutive-failure counter
 
 check_phantom_usb_attachments() {
     local now=$(date +%s)
@@ -376,6 +436,7 @@ check_phantom_usb_attachments() {
     fi
     echo "$now" > "$PHANTOM_USB_LAST_CHECK_FILE"
     mkdir -p "$PHANTOM_USB_LAST_DELETE_DIR" 2>/dev/null
+    mkdir -p "$PHANTOM_USB_RETRY_DIR" 2>/dev/null
 
     local vmid pid_file vm_start_ts conf monitor_output qmu_ids line slot
     for vmid in $(get_running_vms); do
@@ -409,7 +470,9 @@ check_phantom_usb_attachments() {
             [[ -z "$slot" ]] && continue
 
             if grep -qx "$slot" <<<"$qmu_ids"; then
-                continue  # attached, healthy
+                # Attached, healthy. Reset retry counter for this slot.
+                rm -f "${PHANTOM_USB_RETRY_DIR}/${vmid}.${slot}" 2>/dev/null
+                continue
             fi
 
             # Phantom: in conf, not in QEMU. Check per-slot cooldown so we
@@ -425,9 +488,33 @@ check_phantom_usb_attachments() {
                 fi
             fi
 
-            log "Phantom USB: ${slot} on VM ${vmid} in conf but not in QEMU runtime; deleting (daemon will re-add)"
+            # Consecutive-failure backstop. Each phantom detection on a slot
+            # whose re-add hasn't taken effect bumps the counter. After
+            # PHANTOM_USB_MAX_RETRIES, stop deleting + log loud — repeated
+            # cycle-enumerate on a stuck slot can poison the host xhci stack
+            # (operator-confirmed standing rule). Counter is reset on the
+            # next healthy attach (above).
+            local retry_file="${PHANTOM_USB_RETRY_DIR}/${vmid}.${slot}"
+            local retries=0
+            [[ -f "$retry_file" ]] && retries=$(cat "$retry_file" 2>/dev/null)
+            [[ -z "$retries" || ! "$retries" =~ ^[0-9]+$ ]] && retries=0
+            if [[ "$retries" -ge "$PHANTOM_USB_MAX_RETRIES" ]]; then
+                # Rate-limit the loud log to once per cooldown interval.
+                local last_loud_file="${PHANTOM_USB_RETRY_DIR}/${vmid}.${slot}.loud"
+                local last_loud=0
+                [[ -f "$last_loud_file" ]] && last_loud=$(cat "$last_loud_file" 2>/dev/null)
+                [[ -z "$last_loud" || ! "$last_loud" =~ ^[0-9]+$ ]] && last_loud=0
+                if [[ $((now - last_loud)) -ge "$PHANTOM_USB_DELETE_COOLDOWN" ]]; then
+                    log "Phantom USB STUCK: ${slot} on VM ${vmid} failed re-attach ${retries}+ times — refusing further delete/re-add (would poison host xhci). Likely cause: VM lacks qemu-xhci controller (was started with no USB devices in conf). Restart VM ${vmid} with usb${slot} in conf to fix."
+                    echo "$now" > "$last_loud_file"
+                fi
+                continue
+            fi
+
+            log "Phantom USB: ${slot} on VM ${vmid} in conf but not in QEMU runtime; deleting (daemon will re-add) [retry=${retries}/${PHANTOM_USB_MAX_RETRIES}]"
             with_lock qm set "$vmid" --delete "$slot" 2>&1 | logger -t usb-hotplug-phantom
             echo "$now" > "$cooldown_file"
+            echo "$((retries + 1))" > "$retry_file"
         done < <(grep -E "^usb[0-9]+:[[:space:]]*(mapping=|host=)" <<<"$conf")
     done
 }
