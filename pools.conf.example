@@ -14,7 +14,9 @@
 # Fields:
 #   pool_name    free-form, used in logs only
 #   vid:pid      4-hex:4-hex (lowercase), the USB VID:PID of the device class
-#   target_vmid  the VM the devices should attach to (must be on this node)
+#   target_vmid  the VM the devices should attach to (must be on this node);
+#                or "shared"/"gpu" → the current GPU VM (follows whichever GPU
+#                VM is running, like shared-* mappings)
 #   first_slot   the lowest usbN slot index the pool owns (0..14)
 #   max_slots    the upper bound on number of devices to attach simultaneously
 #                — extras beyond this count are ignored

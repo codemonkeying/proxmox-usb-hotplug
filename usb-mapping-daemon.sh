@@ -692,6 +692,17 @@ process_pools() {
             log "pool $pool_name: invalid vid:pid '$vidpid'"
             continue
         fi
+        # "shared" / "gpu" target → resolve to the current GPU VM (the same VM
+        # that receives shared-* mappings), so ONE pool line follows whichever
+        # GPU VM is running (e.g. 110 vs 111) instead of being pinned to a fixed
+        # vmid. Resolved before the numeric check below so the rest is unchanged.
+        if [[ "$vmid" == "shared" || "$vmid" == "gpu" ]]; then
+            vmid=$(get_gpu_vm)
+            if [[ -z "$vmid" ]]; then
+                log "pool $pool_name: 'shared' target but no running GPU VM; skipping"
+                continue
+            fi
+        fi
         if ! [[ "$vmid" =~ ^[0-9]+$ && "$first_slot" =~ ^[0-9]+$ && "$max_slots" =~ ^[0-9]+$ ]]; then
             log "pool $pool_name: non-numeric vmid/first_slot/max_slots"
             continue

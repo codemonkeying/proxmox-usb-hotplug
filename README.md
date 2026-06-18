@@ -114,7 +114,7 @@ alfa-router  148f:3070  200  6  1
 
 - `pool_name` — free-form, logs only
 - `vid:pid` — the USB VID:PID of the device class
-- `target_vmid` — the VM the devices should attach to (must be on this node; cross-node entries are silently skipped)
+- `target_vmid` — the VM the devices should attach to (must be on this node; cross-node entries are silently skipped). May also be the literal `shared` (or `gpu`) → resolves to the current GPU VM (the same VM that receives `shared-*` mappings), so the pool follows whichever GPU VM is running instead of being pinned to a fixed id. Useful for devices shared between mutually-exclusive desktop VMs (e.g. a Linux VM and a Windows VM that take turns on the same GPU + peripherals).
 - `first_slot` — lowest `usbN` index the pool owns (e.g. `4` → starts at `usb4`)
 - `max_slots` — maximum number of devices to attach concurrently; extras beyond this are ignored
 - `usb3` — optional 6th field; pass `usb3` or `1` to force `usb3=1` on attach
