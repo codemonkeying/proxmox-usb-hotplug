@@ -1,0 +1,14 @@
+[Unit]
+Description=Host->guest event relay (lid/ACPI/sysfs -> active VM)
+Documentation=https://github.com/codemonkeying/proxmox-usb-hotplug
+After=pve-guests.service qemu-server.service
+Wants=pve-guests.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/event-relay-daemon.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -144,6 +144,33 @@ Some VMs should never be touched by this daemon — a router VM that hard-binds 
 | `/var/run/usb-hotplug.lock` | flock file for critical sections |
 | `/var/run/usb-hotplug-auto-vm.state` | optional integration hook (see below) |
 
+## event-relay (host → guest signal translation layer)
+
+Some host-side signals can't be passed through to a VM at all: the laptop **lid switch** is an ACPI `EV_SW` event (QEMU's `input-linux` only forwards keys/pointer), and ACPI/sysfs state isn't a USB or PCI device. `event-relay` bridges that gap — it watches declared host signals and relays state changes into the target VM via the guest agent, so the guest can react (e.g. a lid-close makes the active desktop VM drop its built-in panel from the layout).
+
+It's a separate service from the USB daemon (so a fault in one can't disturb the other) but reuses the same `shared`/`gpu` target idea: a slot can target a fixed `vmid`, or `shared`/`gpu` to follow whichever VM currently holds the GPU mapping.
+
+**Slots** live in `/etc/usb-hotplug/event-relays.conf` (one per non-comment line):
+
+```
+# <name>  <source>  <target>  <handler>
+lid  acpi-lid  shared  lid
+```
+
+- `source` — `acpi-lid` (`/proc/acpi/button/lid/LID/state`) or `sysfs:<path>:<open-value>`
+- `target` — `<vmid>` | `shared` | `gpu` (shared/gpu resolve to the current GPU VM)
+- `handler` — token passed to the guest dispatcher
+
+On a state **change** (never on startup) the daemon runs, fire-and-forget so a slow guest command can never wedge the agent:
+
+```
+qm guest exec <vmid> --synchronous 0 -- /usr/local/bin/vm-event-handler <handler> <state>
+```
+
+**The framework is host-agnostic and ships idle** — no active slots by default. Each host enables only the slots that make sense for it (the lid slot is laptop-only). The **guest** must have `/usr/local/bin/vm-event-handler`; reference handlers are in [`guest-handlers/`](guest-handlers/). The Linux handler auto-detects the built-in panel at runtime (NVIDIA `ConnectorType: Panel`, or `eDP*` on Wayland) and toggles it — never pinned to a connector name, so it adapts as external displays change, and does nothing if no built-in panel is connected.
+
+Handles the **relay class** only (switch/ACPI/sysfs state). Keypress devices (e.g. ThinkPad Fn keys, which *are* `EV_KEY`) belong in the VM's `input-linux` args at start, not here.
+
 ## Uninstall
 
 ```bash

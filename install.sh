@@ -62,6 +62,29 @@ else
     exit 1
 fi
 
+# --- event-relay (host->guest signal translation layer) ---------------------
+# Generic on every host; idle until you define slots in event-relays.conf.
+echo ""
+echo "Installing event-relay (host->guest signal translation layer)..."
+if [[ -f event-relay-daemon.sh && -f event-relay.service ]]; then
+    install -m 0755 event-relay-daemon.sh /usr/local/bin/event-relay-daemon.sh
+    install -m 0644 event-relay.service /etc/systemd/system/event-relay.service
+    if [[ ! -f /etc/usb-hotplug/event-relays.conf ]]; then
+        install -m 0644 event-relays.conf.example /etc/usb-hotplug/event-relays.conf
+        echo "  Wrote default /etc/usb-hotplug/event-relays.conf (no active slots)"
+    fi
+    systemctl daemon-reload
+    systemctl enable event-relay.service >/dev/null 2>&1
+    systemctl restart event-relay.service
+    if systemctl is-active --quiet event-relay.service; then
+        echo "  event-relay active (idle until slots are defined; guest handlers go in guest-handlers/)"
+    else
+        echo "  WARNING: event-relay failed — check: systemctl status event-relay.service"
+    fi
+else
+    echo "  (event-relay files not in this checkout — skipping)"
+fi
+
 cat <<'EOF'
 
 Next steps:

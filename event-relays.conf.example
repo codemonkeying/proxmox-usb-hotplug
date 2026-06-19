@@ -1,0 +1,31 @@
+# /etc/usb-hotplug/event-relays.conf — host->guest signal relay "slots"
+#
+# Handled by event-relay-daemon.sh. Relays host-side STATE signals (lid, ACPI,
+# sysfs values) that QEMU cannot pass through, to a target VM — resolving
+# "shared"/"gpu" to the current GPU VM (same logic as shared-* USB mappings),
+# so a slot follows whichever desktop VM is up.
+#
+# This handles the RELAY class only (switch/ACPI/sysfs state that can't be
+# evdev-forwarded). Keypress devices (e.g. ThinkPad Fn keys) belong in the VM's
+# input-linux args at start, not here.
+#
+# One slot per non-comment line, whitespace-separated:
+#   <name>  <source>  <target>  <handler>
+#
+#   name     free-form label (logs + per-slot state key)
+#   source   acpi-lid                  -> /proc/acpi/button/lid/LID/state (open|closed)
+#            sysfs:<path>:<open-value> -> poll a sysfs/proc file; "open" if value==open-value
+#   target   <vmid> | shared | gpu     -> shared/gpu = current GPU VM (follows the desktop VM)
+#   handler  token passed to the guest dispatcher: vm-event-handler <handler> <state>
+#
+# Relayed on a state CHANGE only (never on daemon startup). The target guest must
+# have /usr/local/bin/vm-event-handler installed (see guest-handlers/ in the repo).
+#
+# NO ACTIVE SLOTS BY DEFAULT — the daemon idles until you add one below.
+# This is intentional: the framework ships on every host; each host enables only
+# the slots that make sense for it.
+
+# --- EXAMPLE (laptop only): lid -> active desktop VM manages its built-in panel ---
+# Requires guest-handlers/vm-event-handler-linux.sh installed in the target guest
+# (auto-detects the built-in panel via ConnectorType: Panel / eDP*, toggles it).
+# lid  acpi-lid  shared  lid
