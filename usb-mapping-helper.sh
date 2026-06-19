@@ -266,7 +266,7 @@ get_available_pci_mappings_for_vm() {
             continue
         fi
         # Only shared-* and vm${vmid}-* mappings are eligible. Other mappings
-        # (e.g. pvep16_A4500GPU) are hardcoded in the profile config and must
+        # (e.g. host1_gpu) are hardcoded in the profile config and must
         # not be double-added.
         if [[ "$mapping" =~ ^vm${vmid}- ]] || [[ "$mapping" =~ ^shared- ]]; then
             echo "${mapping}|${id}|${description}|${path}"
