@@ -133,7 +133,11 @@ vm_has_xhci() {
     pid=$(cat "$pid_file" 2>/dev/null)
     [[ -z "$pid" || ! -r "/proc/$pid/cmdline" ]] && return 1
     local has=0
-    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "qemu-xhci"; then
+    # PVE/QEMU names the xHCI controller differently by version: older builds
+    # emit "qemu-xhci", qemu 10.x (PVE 9.2) emits "nec-usb-xhci". Match both —
+    # grepping only "qemu-xhci" silently false-negatives the whole fleet and
+    # forces the UHCI fallback for high-speed radios (RT3070/RT5370/MT7921).
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qE "(qemu|nec-usb)-xhci"; then
         has=1
     fi
     XHCI_CACHE_KEY[$vmid]="$key"
