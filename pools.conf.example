@@ -3,13 +3,12 @@
 # Pools solve the "two identical USB devices" problem that standard PVE
 # mappings can't: when you have N copies of the same VID:PID with no unique
 # iSerial (game controllers, WiFi adapters, DACs, etc.), there's no way to
-# tell them apart. A pool dynamically assigns whichever devices are present
-# to a fixed range of consecutive usbN slots on a target VM, sorted by USB
-# path (lowest path = first slot).
+# tell them apart. A pool attaches whichever devices are present, by live
+# bus-port, into the lowest free usbN slots on a target VM.
 #
 # Format — one pool per non-comment line, whitespace-separated:
 #
-#   <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_slots>  [usb3]
+#   <pool_name>  <vid:pid>  <target_vmid>  <max_devices>  [usb3]
 #
 # Fields:
 #   pool_name    free-form, used in logs only
@@ -17,28 +16,27 @@
 #   target_vmid  the VM the devices should attach to (must be on this node);
 #                or "shared"/"gpu" → the current GPU VM (follows whichever GPU
 #                VM is running, like shared-* mappings)
-#   first_slot   the lowest usbN slot index the pool owns (0..14)
-#   max_slots    the upper bound on number of devices to attach simultaneously
+#   max_devices  the upper bound on number of devices to attach simultaneously
 #                — extras beyond this count are ignored
-#   usb3         optional 6th field — pass "usb3" or "1" to force usb3=1 on
+#   usb3         optional last field — pass "usb3" or "1" to force usb3=1 on
 #                attach. Omit for default (USB2 emulation).
+#
+# Legacy 6-field lines (<name> <vid:pid> <target> <first_slot> <max> [usb3])
+# still parse; first_slot no longer reserves slots.
 #
 # Behavior:
 #   - Pool fires every poll alongside the standard mapping logic.
-#   - Slots in [first_slot, first_slot+max_slots-1] that contain a non-pool
-#     entry (mapping=..., host=<vid:pid>, etc.) are LEFT ALONE. The pool only
-#     touches slots whose value is host=<bus-port> (the format it writes).
+#   - Each device attaches by its live bus-port (host=<port>) into the lowest
+#     FREE usbN slot (same rule as shared-*/vmN-* mappings — no reserved range,
+#     so pools and mappings never collide).
+#   - Sticky: a device keeps its slot while plugged in. On unplug only its own
+#     slot is deleted; other pool devices never move.
+#   - The pool only removes host= slots it attached itself. mapping=... slots
+#     and manual host= slots for other devices are never touched.
 #   - Pool entries targeting cross-node VMs are silently skipped.
-#   - On hotplug: new device matching the VID:PID attaches to the next free
-#     pool slot. On unplug: the corresponding slot is deleted from VM conf.
-#
-# Slot identity caveat: pool members are interchangeable. Slot N always
-# attaches to whichever pool device has the lowest current USB path. If you
-# unplug one and plug it into a different port, slots may shift on the next
-# poll. For most use cases (controllers, wifi adapters) that's fine.
 
-# Example: 2× SteelSeries Stratus Duo dongles (1038:1430) → VM 110 slots usb4 + usb5, USB3 enabled
-# steelseries  1038:1430  110  4  2  usb3
+# Example: 2× SteelSeries Stratus Duo dongles (1038:1430) → current GPU VM, USB3 enabled
+# steelseries  1038:1430  shared  2  usb3
 
-# Example: 2× Alfa AWUS036NH USB wifi (148f:3070) — one on this host's VM 200 router
-# alfa-router  148f:3070  200  6  1
+# Example: Alfa AWUS036NH USB wifi (148f:3070) → this host's VM 200 router
+# alfa-router  148f:3070  200  1

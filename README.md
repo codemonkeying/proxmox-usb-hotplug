@@ -102,28 +102,31 @@ Example naming scheme for a two-VM home lab where VM 110 is a Linux desktop with
 
 Standard mappings break down when you have **two or more physically identical** USB devices — same VID:PID, no unique iSerial. The classic example is a pair of identical game-controller wireless dongles (SteelSeries Stratus Duo, Xbox 360 wireless, etc.), but the same problem applies to multiple identical USB WiFi adapters, audio interfaces, security keys, or webcams. PVE's USB passthrough only distinguishes such devices by physical USB path — but pinning a `path=` in the mapping locks you to one specific port on one specific dock, which defeats the point of plug-anywhere.
 
-**A pool** fixes this by dynamically assigning whichever matching devices are currently plugged in to a fixed range of consecutive `usbN:` slots on a target VM, sorted by USB path (lowest path → first slot). Plug into any port on any dock — the pool picks it up.
+**A pool** fixes this by attaching whichever matching devices are currently plugged in, each by its live bus-port (`host=<port>`), into the **lowest free** `usbN:` slot on the target VM — the same rule `shared-*` / `vmN-*` mappings use, so pools and mappings never fight over a slot. Plug into any port on any dock — the pool picks it up.
 
 Define pools in `/etc/usb-hotplug/pools.conf` (one per non-comment line, whitespace-separated):
 
 ```
-# <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_slots>  [usb3]
-steelseries  1038:1430  110  4  2  usb3
-alfa-router  148f:3070  200  6  1
+# <pool_name>  <vid:pid>  <target_vmid>  <max_devices>  [usb3]
+steelseries  1038:1430  shared  2  usb3
+alfa-router  148f:3070  200     1
 ```
 
 - `pool_name` — free-form, logs only
 - `vid:pid` — the USB VID:PID of the device class
 - `target_vmid` — the VM the devices should attach to (must be on this node; cross-node entries are silently skipped). May also be the literal `shared` (or `gpu`) → resolves to the current GPU VM (the same VM that receives `shared-*` mappings), so the pool follows whichever GPU VM is running instead of being pinned to a fixed id. Useful for devices shared between mutually-exclusive desktop VMs (e.g. a Linux VM and a Windows VM that take turns on the same GPU + peripherals).
-- `first_slot` — lowest `usbN` index the pool owns (e.g. `4` → starts at `usb4`)
-- `max_slots` — maximum number of devices to attach concurrently; extras beyond this are ignored
-- `usb3` — optional 6th field; pass `usb3` or `1` to force `usb3=1` on attach
+- `max_devices` — maximum number of devices to attach concurrently; extras beyond this are ignored
+- `usb3` — optional last field; pass `usb3` or `1` to force `usb3=1` on attach
+
+Older 6-field lines (`<name> <vid:pid> <target> <first_slot> <max_slots> [usb3]`) still work: `first_slot` no longer reserves slots, it is only used after a daemon restart to recognise and clean up stale pool slots written by the old version.
 
 A copy of the example file ships as `pools.conf.example` — copy it to `/etc/usb-hotplug/pools.conf` and edit. Pools fire every poll alongside the standard mapping logic.
 
-**Safety**: pool-owned slots are recognised by their `host=<bus-port>` value (the format the pool itself writes). Slots in the pool range that contain a different format (`mapping=...`, `host=<vid:pid>`, etc.) are **left alone** — the pool never clobbers manually-configured slots. Pick a `first_slot` that doesn't overlap with any of your `vmN-` / `shared-` mappings to avoid contention.
+**Sticky slots**: a device keeps its slot for as long as it stays plugged in. Unplugging one pool device frees only its own slot and never moves the others; a replugged device takes the lowest free slot.
 
-**Slot identity caveat**: pool members are interchangeable to PVE. Slot `first_slot` always holds whichever pool device has the lowest current USB path. If you unplug one device and plug it into a different port, the pool may re-assign slots on the next poll. For most use cases (controllers, wifi adapters) this is fine; for cases where the OS inside the VM needs a stable per-device identity (e.g. a USB audio device with persistent ALSA bindings), use traditional `path=`-locked mappings instead.
+**Safety**: the pool only detaches `host=<port>` slots it attached itself (or, after a restart, stale ones inside a legacy `first_slot` range). `mapping=...` slots and manually-configured `host=` slots for other devices are never touched.
+
+**Slot identity caveat**: pool members are interchangeable to PVE — which slot a given physical device gets depends on plug order. For cases where the guest needs a stable per-device identity (e.g. a USB audio device with persistent ALSA bindings), use traditional `path=`-locked mappings instead.
 
 ## Protected VMs
 

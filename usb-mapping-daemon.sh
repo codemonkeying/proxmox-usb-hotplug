@@ -10,6 +10,7 @@ STATE_FILE="/var/run/usb-hotplug.state"
 AUTO_VM_FILE="/var/run/usb-hotplug-auto-vm.state"
 LOCK_FILE="/var/run/proxmox-vm-conf.lock"
 GPU_MISS_THRESHOLD=2  # require N consecutive empty GPU-VM polls before treating as a real transition (debounces mid-run qm-start/stop transients)
+MAX_USB_SLOTS=14  # PVE allows usb0..usb13 ($MAX_USB_DEVICES in PVE/QemuServer/USB.pm)
 BOOT_GRACE_SECONDS=180  # at daemon start, suppress cleanup_stale_shared_mappings for this long so pve-guests has time to start VM 110 before we strip its conf (2026-06-04 reboot incident)
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
@@ -28,6 +29,20 @@ log() {
     echo "$msg"
     echo "$msg" >> "$LOG_FILE"
 }
+
+# log_once KEY MSG — log MSG only the first time KEY is seen this daemon run
+# (stops a persistent condition from spamming the log every 2s poll).
+declare -A LOG_ONCE_SEEN=()
+log_once() {
+    [[ -n "${LOG_ONCE_SEEN[$1]:-}" ]] && return 0
+    LOG_ONCE_SEEN[$1]=1
+    log "$2"
+}
+
+# POOL_OWNED["vmid:slot"]=pool_name — slots the pool attached (or adopted)
+# during this daemon run. Lets a pool detach its own slot when the device goes
+# away, without ever touching a manually-configured host= slot.
+declare -A POOL_OWNED=()
 
 with_lock() {
     # Subshell so fd 200 closes on return, releasing the flock. Without the
@@ -278,7 +293,7 @@ add_mapping_to_running_vm() {
     fi
 
     local slot=""
-    for i in {0..14}; do
+    for i in $(seq 0 $((MAX_USB_SLOTS - 1))); do
         if ! grep -qE "^usb${i}:" <<<"$conf"; then
             slot=$i
             break
@@ -632,22 +647,19 @@ cleanup_stale_shared_mappings() {
 # standard PVE mappings can't: when you have N copies of the same VID:PID
 # (game controllers, WiFi adapters, DACs, etc.), the only way to disambiguate
 # them is by physical USB path — but pinning a path makes the device port-
-# specific. A pool dynamically assigns whichever devices are present to a
-# fixed range of consecutive usbN slots on a target VM, sorted by USB path
-# (lowest path = first slot).
+# specific. A pool attaches whichever matching devices are present, each by
+# its live bus-port (host=<port>), into the lowest FREE usbN slot — the same
+# rule shared-* mappings use, so the two can never fight over a slot.
 #
 # Config file format — /etc/usb-hotplug/pools.conf
-#   <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_slots>  [usb3]
-# One pool per non-comment line. Whitespace-separated. Pool name is free-form
-# (used in logs only). max_slots is the upper bound on how many devices to
-# attach simultaneously; extras are ignored. first_slot is the lowest usbN
-# index the pool owns; the pool occupies [first_slot, first_slot+max_slots-1].
-# Append "usb3" (or "1") as the optional 6th field to force usb3=1 on attach.
+#   <pool_name>  <vid:pid>  <target_vmid>  <max_devices>  [usb3]
+# Legacy lines with an extra first_slot field still parse:
+#   <pool_name>  <vid:pid>  <target_vmid>  <first_slot>  <max_devices>  [usb3]
+# (first_slot no longer reserves anything; see process_pools.)
 #
-# Pool-owned slots are recognised by the daemon by their `host=<bus-port>`
-# value (the format the pool itself writes). Slots in the pool range with a
-# different format (mapping=..., host=<vid:pid>, etc.) are LEFT ALONE — the
-# pool never clobbers a manually-configured slot.
+# Slots are sticky: a device keeps its slot while plugged in; unplugging one
+# device never moves another. Manually-configured host= slots for other
+# devices are never touched.
 #
 # Pools fire on every poll alongside the mapping logic. Pool entries pointing
 # at VMs not running on this host are silently skipped (qm status returns
@@ -681,19 +693,31 @@ find_pool_paths() {
 process_pools() {
     [[ ! -f "$POOLS_CONF" ]] && return 0
 
-    local pool_name vidpid vmid first_slot max_slots usb3_flag
-    while read -r pool_name vidpid vmid first_slot max_slots usb3_flag _rest; do
+    # Two accepted line formats:
+    #   new:    <name> <vid:pid> <target> <max_devices> [usb3]
+    #   legacy: <name> <vid:pid> <target> <first_slot> <max_slots> [usb3]
+    # Legacy first_slot no longer reserves slots; it is only used to recognise
+    # pool slots written by an older daemon (detach-after-restart).
+    local pool_name vidpid vmid f4 f5 f6 max_slots usb3_flag legacy_first
+    while read -r pool_name vidpid vmid f4 f5 f6 _rest; do
         # Strip whole-line comments / blank lines (read loses the # split,
         # so check the first field).
         [[ -z "$pool_name" || "$pool_name" =~ ^# ]] && continue
 
+        legacy_first=""
+        if [[ "$f5" =~ ^[0-9]+$ ]]; then
+            legacy_first=$f4; max_slots=$f5; usb3_flag=$f6
+        else
+            max_slots=$f4; usb3_flag=$f5
+        fi
+
         # Validate required fields.
-        if [[ -z "$vidpid" || -z "$vmid" || -z "$first_slot" || -z "$max_slots" ]]; then
-            log "pool: skipping incomplete entry: $pool_name"
+        if [[ -z "$vidpid" || -z "$vmid" || -z "$max_slots" ]]; then
+            log_once "pool-bad-$pool_name" "pool: skipping incomplete entry: $pool_name"
             continue
         fi
         if ! [[ "$vidpid" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
-            log "pool $pool_name: invalid vid:pid '$vidpid'"
+            log_once "pool-bad-$pool_name" "pool $pool_name: invalid vid:pid '$vidpid'"
             continue
         fi
         # "shared" / "gpu" target → resolve to the current GPU VM (the same VM
@@ -703,12 +727,12 @@ process_pools() {
         if [[ "$vmid" == "shared" || "$vmid" == "gpu" ]]; then
             vmid=$(get_gpu_vm)
             if [[ -z "$vmid" ]]; then
-                log "pool $pool_name: 'shared' target but no running GPU VM; skipping"
+                log_once "pool-nogpu-$pool_name" "pool $pool_name: 'shared' target but no running GPU VM; skipping"
                 continue
             fi
         fi
-        if ! [[ "$vmid" =~ ^[0-9]+$ && "$first_slot" =~ ^[0-9]+$ && "$max_slots" =~ ^[0-9]+$ ]]; then
-            log "pool $pool_name: non-numeric vmid/first_slot/max_slots"
+        if ! [[ "$vmid" =~ ^[0-9]+$ && "$max_slots" =~ ^[0-9]+$ ]]; then
+            log_once "pool-bad-$pool_name" "pool $pool_name: non-numeric vmid/max_devices"
             continue
         fi
         [[ "$max_slots" -lt 1 ]] && continue
@@ -722,7 +746,7 @@ process_pools() {
             usb3_arg=",usb3=1"
         fi
 
-        # Discover currently-present devices and assign by sort order.
+        # Discover currently-present devices (sorted by bus-port path).
         local -a paths=()
         local p
         while IFS= read -r p; do
@@ -730,59 +754,71 @@ process_pools() {
         done < <(find_pool_paths "$vidpid")
 
         local conf_snapshot
-        conf_snapshot=$(qm config "$vmid" 2>/dev/null) || continue
+        conf_snapshot=$(qm_config_safe "$vmid") || continue
 
-        # Two-pass slot assignment (2026-06-08 night): the old loop did a fixed
-        # paths[i] -> slot[first_slot+i] mapping. If any slot in the range was
-        # occupied by a non-pool entry (e.g. a shared-* mapping landed there),
-        # the paths assigned to that index were dropped on the floor — leaving
-        # an identical-VID:PID device unattached. New flow:
-        #   Pass 1: determine which slots in [first_slot, first_slot+max_slots)
-        #           are usable (empty OR currently holding a pool entry).
-        #   Pass 2: zip paths -> usable_slots in order, log when paths exceed
-        #           usable slots, detach pool ghosts in usable slots without a path.
-        local i slot current_conf
-        local -a usable_slots=()
-        for ((i=0; i<max_slots; i++)); do
-            slot=$((first_slot + i))
-            current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
-            if [[ -z "$current_conf" || "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
-                usable_slots+=("$slot")
-            else
-                log "pool $pool_name: VM $vmid usb${slot} occupied by non-pool entry (${current_conf}); skipping"
+        # Dynamic, sticky slot assignment (2026-10-18). Pools no longer own a
+        # fixed slot range: a fixed range let shared-* mappings (which take the
+        # lowest free slot) land inside it, and the pool then refused to evict
+        # them — leaving the 2nd identical device unattached forever.
+        #   1. Adopt: any host=<port> slot whose port currently holds a device
+        #      of this pool's VID:PID is ours. It stays exactly where it is.
+        #   2. Attach: present devices not yet in any slot get the lowest free
+        #      slot (same rule shared-* mappings use), up to max_devices.
+        #   3. Detach: a host=<port> slot we own whose device is gone. "Ours" =
+        #      attached by the pool during this daemon run (POOL_OWNED), or —
+        #      after a daemon restart — inside the legacy first_slot range.
+        #      Manually-configured host= slots for other devices are never touched.
+        local line slot val port i
+        local -A port_slot=()      # port -> slot, for this pool's present devices
+        local -A present=()
+        for p in "${paths[@]}"; do present[$p]=1; done
+        local -a gone_slots=()
+        while IFS= read -r line; do
+            slot=$(sed -n 's/^usb\([0-9]\+\):.*/\1/p' <<<"$line")
+            val=$(sed 's/^[^:]*:[[:space:]]*//' <<<"$line")
+            [[ "$val" =~ ^host=([0-9]+-[0-9.]+)($|,) ]] || continue
+            port="${BASH_REMATCH[1]}"
+            if [[ -n "${present[$port]:-}" ]]; then
+                port_slot[$port]=$slot
+                POOL_OWNED["$vmid:$slot"]="$pool_name"
+            elif [[ "${POOL_OWNED[$vmid:$slot]:-}" == "$pool_name" ]] || \
+                 [[ "$legacy_first" =~ ^[0-9]+$ && "$slot" -ge "$legacy_first" && "$slot" -lt $((legacy_first + max_slots)) \
+                    && ! -e "/sys/bus/usb/devices/$port" ]]; then
+                # Ours and our device is no longer on that port (unplugged, or
+                # something else is plugged there now) -> free the slot.
+                gone_slots+=("$slot")
             fi
+        done < <(grep -E '^usb[0-9]+:' <<<"$conf_snapshot")
+
+        for slot in "${gone_slots[@]}"; do
+            log "pool $pool_name: detach VM $vmid usb${slot} (device gone)"
+            with_lock qm set "$vmid" "--delete" "usb${slot}" 2>&1 | logger -t usb-hotplug-pool
+            unset "POOL_OWNED[$vmid:$slot]"
+            conf_snapshot=$(grep -vE "^usb${slot}:" <<<"$conf_snapshot")
         done
 
-        local current_path desired
-        local -A path_assigned=()
-        for ((i=0; i<${#paths[@]}; i++)); do
-            if [[ "$i" -ge "${#usable_slots[@]}" ]]; then
-                log "pool $pool_name: no usable slot for path ${paths[i]} (pool range exhausted — bump max_slots or move first_slot)"
+        local attached=${#port_slot[@]} desired
+        for p in "${paths[@]}"; do
+            [[ -n "${port_slot[$p]:-}" ]] && continue
+            if [[ "$attached" -ge "$max_slots" ]]; then
+                log_once "pool-max-$pool_name-$p" "pool $pool_name: $p present but pool already has $max_slots device(s) attached (max_devices); not attaching"
                 continue
             fi
-            slot="${usable_slots[i]}"
-            current_path="${paths[i]}"
-            desired="host=${current_path}${usb3_arg}"
-            current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
-            path_assigned[$slot]=1
-            if [[ "$current_conf" == "$desired" ]]; then
+            slot=""
+            for ((i=0; i<MAX_USB_SLOTS; i++)); do
+                grep -qE "^usb${i}:" <<<"$conf_snapshot" && continue
+                slot=$i; break
+            done
+            if [[ -z "$slot" ]]; then
+                log_once "pool-full-$pool_name-$p" "pool $pool_name: no free usb slot on VM $vmid for $p (all $MAX_USB_SLOTS in use)"
                 continue
             fi
-            if [[ -n "$current_conf" ]]; then
-                log "pool $pool_name: VM $vmid usb${slot} path drift -> $current_path"
-            else
-                log "pool $pool_name: attach VM $vmid usb${slot} -> $current_path"
-            fi
+            desired="host=${p}${usb3_arg}"
+            log "pool $pool_name: attach VM $vmid usb${slot} -> $p"
             with_lock qm set "$vmid" "--usb${slot}" "$desired" 2>&1 | logger -t usb-hotplug-pool
-        done
-
-        for slot in "${usable_slots[@]}"; do
-            [[ -n "${path_assigned[$slot]:-}" ]] && continue
-            current_conf=$(echo "$conf_snapshot" | awk -v s="usb${slot}:" '$1==s {sub(/^[^:]+:[[:space:]]*/,""); print; exit}')
-            if [[ -n "$current_conf" && "$current_conf" =~ ^host=[0-9]+-[0-9.]+($|,) ]]; then
-                log "pool $pool_name: detach VM $vmid usb${slot} (device gone)"
-                with_lock qm set "$vmid" "--delete" "usb${slot}" 2>&1 | logger -t usb-hotplug-pool
-            fi
+            POOL_OWNED["$vmid:$slot"]="$pool_name"
+            conf_snapshot+=$'\n'"usb${slot}: ${desired}"
+            attached=$((attached + 1))
         done
     done < "$POOLS_CONF"
 }
@@ -927,7 +963,7 @@ monitor_usb_mappings() {
                     # Find free slot considering both live conf AND already-queued ops.
                     local conf_path="/etc/pve/qemu-server/${target_vm}.conf"
                     local slot=""
-                    for i in {0..14}; do
+                    for ((i=0; i<MAX_USB_SLOTS; i++)); do
                         if grep -q "^usb${i}:" "$conf_path"; then continue; fi
                         # Skip if already queued for this VM in this iteration.
                         local queued=0
